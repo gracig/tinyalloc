@@ -30,6 +30,7 @@ pub trait Allocator {
     fn free(&mut self, handle: Handle) -> bool;
     fn len(&self) -> usize;
     fn capacity(&self) -> usize;
+    fn block_size(&self) -> usize;
     fn alloc(&mut self, data: &[u8]) -> Option<Handle> {
         let (h, buf) = self.alloc_uninit(data.len())?;
         buf.copy_from_slice(data);

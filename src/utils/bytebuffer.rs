@@ -9,18 +9,61 @@ pub enum ByteBufferError {
 
 const NONE_SLOT: u8 = u8::MAX;
 const NONE_GEN: u8 = 0;
-const CHUNK: usize = 8;
 
-#[repr(C)]
-struct Node {
-    len: u8,
-    data: [u8; CHUNK],
-    next_slot: u8,
-    next_gen: u8,
+/// Block layout in arena memory (zero-copy interpretation):
+/// [0]       = len (u8) - number of data bytes used
+/// [1..n-2]  = data bytes (variable size, depends on allocator)
+/// [n-1]     = next_slot (u8) - slot index of next block
+/// [n]       = next_gen (u8) - generation of next block
+
+/// Helper functions to access block metadata without Node struct
+#[inline]
+fn get_len(block: &[u8]) -> u8 {
+    block[0]
 }
 
-const fn node_bytes() -> usize {
-    core::mem::size_of::<Node>()
+#[inline]
+fn set_len(block: &mut [u8], len: u8) {
+    block[0] = len;
+}
+
+#[inline]
+fn get_next_slot(block: &[u8]) -> u8 {
+    block[block.len() - 2]
+}
+
+#[inline]
+fn set_next_slot(block: &mut [u8], slot: u8) {
+    let idx = block.len() - 2;
+    block[idx] = slot;
+}
+
+#[inline]
+fn get_next_gen(block: &[u8]) -> u8 {
+    block[block.len() - 1]
+}
+
+#[inline]
+fn set_next_gen(block: &mut [u8], generation: u8) {
+    let idx = block.len() - 1;
+    block[idx] = generation;
+}
+
+#[inline]
+fn get_data(block: &[u8]) -> &[u8] {
+    let len = get_len(block) as usize;
+    &block[1..1 + len]
+}
+
+#[inline]
+fn get_data_mut(block: &mut [u8]) -> &mut [u8] {
+    let len = block.len();
+    &mut block[1..len - 2]
+}
+
+#[inline]
+fn data_capacity(block: &[u8]) -> usize {
+    block.len().saturating_sub(3)
 }
 
 pub struct ByteBuffer {
@@ -120,39 +163,33 @@ impl ByteBuffer {
 
     /* ---- Internal helpers ---- */
 
-    fn alloc_node<A: Allocator>(&self, arena: &mut A) -> Result<Handle, ByteBufferError> {
+    fn alloc_node<A: Allocator>(
+        &self,
+        arena: &mut A,
+        block_size: usize,
+    ) -> Result<Handle, ByteBufferError> {
+        if block_size < 3 {
+            return Err(ByteBufferError::AllocationFailed);
+        }
+
         let (h, buf) = arena
-            .alloc_uninit(node_bytes())
+            .alloc_uninit(block_size)
             .ok_or(ByteBufferError::AllocationFailed)?;
 
-        let node = Self::node_from_bytes_mut(buf)?;
-        node.len = 0;
-        node.data.fill(0);
-        node.next_slot = NONE_SLOT;
-        node.next_gen = NONE_GEN;
+        set_len(buf, 0);
+        set_next_slot(buf, NONE_SLOT);
+        set_next_gen(buf, NONE_GEN);
+        // Data area is already uninitialized, no need to zero it
 
         Ok(h)
     }
 
-    fn node_from_bytes(slice: &[u8]) -> Result<&Node, ByteBufferError> {
-        if slice.len() != node_bytes() {
-            return Err(ByteBufferError::Uninitialized);
-        }
-        Ok(unsafe { &*(slice.as_ptr() as *const Node) })
-    }
-
-    fn node_from_bytes_mut(slice: &mut [u8]) -> Result<&mut Node, ByteBufferError> {
-        if slice.len() != node_bytes() {
-            return Err(ByteBufferError::Uninitialized);
-        }
-        Ok(unsafe { &mut *(slice.as_mut_ptr() as *mut Node) })
-    }
-
-    fn next_of(node: &Node) -> Option<Handle> {
-        if node.next_slot == NONE_SLOT {
+    fn get_next_handle(block: &[u8]) -> Option<Handle> {
+        let slot = get_next_slot(block);
+        if slot == NONE_SLOT {
             None
         } else {
-            Some(Handle::new(node.next_slot as u16, node.next_gen))
+            Some(Handle::new(slot as u16, get_next_gen(block)))
         }
     }
 }
@@ -189,11 +226,10 @@ impl<'a, A: Allocator> Iterator for ByteChunkIter<'a, A> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let h = self.next_handle?;
-        let slice = self.arena.get(h)?;
-        let node = ByteBuffer::node_from_bytes(slice).ok()?;
-        let len = node.len as usize;
-        self.next_handle = ByteBuffer::next_of(node);
-        Some(&node.data[..len])
+        let block = self.arena.get(h)?;
+        let data = get_data(block);
+        self.next_handle = ByteBuffer::get_next_handle(block);
+        Some(data)
     }
 }
 
@@ -207,9 +243,8 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
         let mut cursor = self.buf.head;
         while let Some(h) = cursor {
             cursor = {
-                let slice = self.arena.get(h).unwrap();
-                let node = ByteBuffer::node_from_bytes(slice).unwrap();
-                ByteBuffer::next_of(node)
+                let block = self.arena.get(h).unwrap();
+                ByteBuffer::get_next_handle(block)
             };
             let _ = self.arena.free(h);
         }
@@ -226,7 +261,9 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
         }
 
         if self.buf.tail.is_none() {
-            let h = self.buf.alloc_node(self.arena)?;
+            // Request allocator's block size
+            let block_size = self.arena.block_size();
+            let h = self.buf.alloc_node(self.arena, block_size)?;
             self.buf.head = Some(h);
             self.buf.tail = Some(h);
         }
@@ -235,34 +272,36 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
 
         // Check if we need a new node first
         let needs_new_node = {
-            let slice = self
+            let block = self
                 .arena
                 .get_mut(tail)
                 .ok_or(ByteBufferError::Uninitialized)?;
-            let node = ByteBuffer::node_from_bytes_mut(slice)?;
-            node.len as usize == CHUNK
+            let len = get_len(block) as usize;
+            let capacity = data_capacity(block);
+            len >= capacity
         };
 
         if needs_new_node {
-            let new = self.buf.alloc_node(self.arena)?;
+            let block_size = self.arena.block_size();
+            let new = self.buf.alloc_node(self.arena, block_size)?;
 
             // Now update the old tail to point to new node
-            let slice = self.arena.get_mut(tail).unwrap();
-            let node = ByteBuffer::node_from_bytes_mut(slice)?;
-            node.next_slot = new.slot as u8;
-            node.next_gen = new.generation;
+            let block = self.arena.get_mut(tail).unwrap();
+            set_next_slot(block, new.slot as u8);
+            set_next_gen(block, new.generation);
 
             self.buf.tail = Some(new);
 
-            let slice = self.arena.get_mut(new).unwrap();
-            let n = ByteBuffer::node_from_bytes_mut(slice)?;
-            n.data[0] = b;
-            n.len = 1;
+            let block = self.arena.get_mut(new).unwrap();
+            let data = get_data_mut(block);
+            data[0] = b;
+            set_len(block, 1);
         } else {
-            let slice = self.arena.get_mut(tail).unwrap();
-            let node = ByteBuffer::node_from_bytes_mut(slice)?;
-            node.data[node.len as usize] = b;
-            node.len += 1;
+            let block = self.arena.get_mut(tail).unwrap();
+            let len = get_len(block) as usize;
+            let data = get_data_mut(block);
+            data[len] = b;
+            set_len(block, (len + 1) as u8);
         }
 
         self.buf.len += 1;
@@ -283,9 +322,20 @@ mod tests {
     use crate::backend::naive::NaiveAllocator;
 
     #[test]
-    fn test_node_size() {
-        // Node is: len(1) + data[8] + next_slot(1) + next_gen(1) = 11 bytes with #[repr(C)]
-        assert_eq!(node_bytes(), 11);
+    fn test_block_layout() {
+        // Verify block layout with actual allocator
+        let mut alloc = NaiveAllocator::new();
+        let (h, block) = alloc.alloc_uninit(11).unwrap();
+
+        set_len(block, 5);
+        set_next_slot(block, 42);
+        set_next_gen(block, 3);
+
+        let block = alloc.get(h).unwrap();
+        assert_eq!(get_len(block), 5);
+        assert_eq!(get_next_slot(block), 42);
+        assert_eq!(get_next_gen(block), 3);
+        assert_eq!(data_capacity(block), 8); // 11 - 3 = 8 bytes for data
     }
 
     // Helper to collect bytes into a fixed array for testing
@@ -395,7 +445,7 @@ mod tests {
         let mut alloc = NaiveAllocator::new();
         let mut buf = ByteBuffer::new();
 
-        // Write 20 bytes - should span multiple CHUNK-sized nodes
+        // Write 20 bytes
         let mut data = [0u8; 20];
         for i in 0..20 {
             data[i] = i as u8;
@@ -406,8 +456,10 @@ mod tests {
         for _chunk in buf.read(&alloc).chunks() {
             chunk_count += 1;
         }
-        assert!(chunk_count >= 3); // At least 3 chunks for 20 bytes with CHUNK=8
+        // With variable block sizes, we just verify we have at least 1 chunk
+        assert!(chunk_count >= 1);
 
+        // Verify all data is readable
         let (reconstructed, count) = collect_bytes(&buf.read(&alloc), 256);
         assert_eq!(count, 20);
         assert_eq!(&reconstructed[..20], &data[..]);

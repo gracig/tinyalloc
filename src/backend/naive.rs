@@ -93,6 +93,10 @@ impl Allocator for NaiveAllocator {
         MAX_SLOTS
     }
 
+    fn block_size(&self) -> usize {
+        MAX_ALLOC_SIZE
+    }
+
     fn clear(&mut self) {
         self.slots = [const { None }; MAX_SLOTS];
         self.next_slot = 0;

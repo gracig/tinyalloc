@@ -181,6 +181,10 @@ impl<const CAPACITY: usize, const SLOTS: usize> Allocator for TinySlabAllocator<
         SLOTS
     }
 
+    fn block_size(&self) -> usize {
+        Self::BLOCK_SIZE
+    }
+
     fn clear(&mut self) {
         // Reset all metadata
         for slot in &mut self.slots {
