@@ -13,7 +13,7 @@ pub use crate::Handle;
 pub use crate::backend::tinyslab::TinySlabAllocator;
 
 #[cfg(feature = "bytebuffer")]
-pub use crate::utils::bytebuffer::ByteBuffer;
+pub use crate::utils::bytebuffer::{ByteBuffer, ByteBufferError};
 
 #[cfg(feature = "bytebuffer-deque")]
 pub use crate::utils::bytebufferdeque::ByteBufferDeque;
