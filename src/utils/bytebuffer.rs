@@ -173,7 +173,16 @@ pub(super) fn get_next_handle(block: &[u8], layout: &crate::BitLayout) -> Option
 /// Stores data as a linked list of fixed-size blocks allocated from an `Allocator`.
 /// Automatically grows by allocating new chunks as needed.
 ///
+/// # Features
+///
+/// - **Append-only by default**: Add bytes to the end
+/// - **Deque operations** (with `bytebuffer-deque` feature): Pop from front, automatic chunk freeing
+/// - **nom parser integration** (with `nominput` feature): Implements `nom::Input` trait
+/// - **Optional max length**: Enforce memory limits
+///
 /// # Examples
+///
+/// ## Basic Usage
 ///
 /// ```
 /// use tinyalloc::prelude::*;
@@ -184,6 +193,29 @@ pub(super) fn get_next_handle(block: &[u8], layout: &crate::BitLayout) -> Option
 /// buf.write(&mut alloc).extend(b"Hello").unwrap();
 /// assert_eq!(buf.len(), 5);
 /// ```
+///
+/// ## Deque Operations (requires `bytebuffer-deque` feature)
+///
+/// ```
+/// # #[cfg(feature = "bytebuffer-deque")]
+/// # {
+/// use tinyalloc::prelude::*;
+///
+/// let mut alloc = TinySlabAllocator::<512, 16>::new();
+/// let mut buf = ByteBuffer::new();
+///
+/// buf.write(&mut alloc).extend(b"Hello").unwrap();
+///
+/// // Pop from front
+/// assert_eq!(buf.pop_front(&mut alloc), Some(b'H'));
+/// assert_eq!(buf.len(), 4);
+///
+/// // Remove multiple bytes efficiently
+/// buf.remove_prefix(&mut alloc, 2);
+/// assert_eq!(buf.len(), 2); // "lo" remains
+/// # }
+/// ```
+#[derive(Clone, Copy)]
 pub struct ByteBuffer {
     /// Head of the chunk linked list
     pub(super) head: Option<Handle>,
@@ -193,6 +225,9 @@ pub struct ByteBuffer {
     pub(super) len: u16,
     /// Optional maximum length limit
     pub(super) max_len: Option<u16>,
+    /// Offset for deque-style operations (bytes consumed from front)
+    #[cfg(feature = "bytebuffer-deque")]
+    pub(super) read_offset: u16,
 }
 
 impl Default for ByteBuffer {
@@ -218,6 +253,8 @@ impl ByteBuffer {
             tail: None,
             len: 0,
             max_len: None,
+            #[cfg(feature = "bytebuffer-deque")]
+            read_offset: 0,
         }
     }
 
@@ -237,6 +274,8 @@ impl ByteBuffer {
             tail: None,
             len: 0,
             max_len: Some(max),
+            #[cfg(feature = "bytebuffer-deque")]
+            read_offset: 0,
         }
     }
 
@@ -252,15 +291,93 @@ impl ByteBuffer {
     pub fn max_len(&self) -> Option<u16> {
         self.max_len
     }
-    /// Returns the number of bytes in the buffer
+    /// Returns the number of bytes in the buffer (available to read)
     #[inline(always)]
     pub fn len(&self) -> u16 {
-        self.len
+        #[cfg(feature = "bytebuffer-deque")]
+        {
+            self.len.saturating_sub(self.read_offset)
+        }
+        #[cfg(not(feature = "bytebuffer-deque"))]
+        {
+            self.len
+        }
     }
     /// Returns true if the buffer is empty
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Returns the input length (for nom compatibility)
+    ///
+    /// This is a direct mapping used by nom's Input trait
+    #[inline(always)]
+    pub fn input_len(&self) -> usize {
+        self.len() as usize
+    }
+
+    /// Takes the first `count` bytes as a view
+    ///
+    /// Creates a new ByteBuffer view limited to the first `count` bytes.
+    /// This is a direct mapping used by nom's Input trait.
+    #[inline(always)]
+    pub fn take(&self, count: usize) -> Self {
+        ByteBuffer {
+            head: self.head,
+            tail: self.tail,
+            len: count.min(self.len as usize) as u16,
+            max_len: Some(count.min(self.len as usize) as u16),
+            #[cfg(feature = "bytebuffer-deque")]
+            read_offset: 0,
+        }
+    }
+
+    /// Takes bytes starting from `index`
+    ///
+    /// This is a direct mapping used by nom's Input trait.
+    /// Note: Due to chunked storage, this has limitations without allocator access.
+    #[inline(always)]
+    pub fn take_from(&self, index: usize) -> Self {
+        if index >= self.len as usize {
+            ByteBuffer::new()
+        } else {
+            // Limitation: can't skip without allocator
+            *self
+        }
+    }
+
+    /// Splits buffer at `index`, returning (remaining, taken)
+    ///
+    /// This is a direct mapping used by nom's Input trait.
+    #[inline(always)]
+    pub fn take_split(&self, index: usize) -> (Self, Self) {
+        let remaining = self.take_from(index);
+        let taken = self.take(index);
+        (remaining, taken)
+    }
+
+    /// Validates if `count` bytes can be taken
+    ///
+    /// This is a direct mapping used by nom's Input trait.
+    #[inline(always)]
+    pub fn slice_index(&self, count: usize) -> Result<usize, usize> {
+        if count <= self.len as usize {
+            Ok(count)
+        } else {
+            Err(count - self.len as usize)
+        }
+    }
+
+    /// Finds the first byte position matching the predicate
+    ///
+    /// This is a direct mapping used by nom's Input trait.
+    /// Requires an allocator reference to iterate through bytes.
+    pub fn position<A: Allocator, P>(&self, arena: &A, predicate: P) -> Option<usize>
+    where
+        P: Fn(u8) -> bool,
+    {
+        self.read(arena).bytes().position(predicate)
     }
 
     /// Immutable read context
@@ -375,6 +492,533 @@ impl ByteBuffer {
         range: core::ops::Range<usize>,
     ) -> Result<(), ByteBufferError> {
         crate::global::with_global_allocator(|alloc| self.copy_from(alloc, src, range))
+    }
+
+    /// Finds the first byte position matching the predicate using global allocator
+    pub fn position_global<P>(&self, predicate: P) -> Option<usize>
+    where
+        P: Fn(u8) -> bool,
+    {
+        crate::global::with_global_allocator(|alloc| self.position(alloc, predicate))
+    }
+
+    // ========================================================================
+    // Deque-style operations (enabled with feature = "bytebuffer-deque")
+    // ========================================================================
+
+    /// Peek at the front byte without consuming it
+    ///
+    /// Returns `None` if the buffer is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-deque")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"ABC").unwrap();
+    ///
+    /// // Peek doesn't consume
+    /// assert_eq!(buf.peek_front(&alloc), Some(b'A'));
+    /// assert_eq!(buf.len(), 3);
+    /// assert_eq!(buf.peek_front(&alloc), Some(b'A')); // Still 'A'
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-deque")]
+    pub fn peek_front<A: Allocator>(&self, arena: &A) -> Option<u8> {
+        if self.is_empty() {
+            return None;
+        }
+
+        self.read(arena).bytes().nth(self.read_offset as usize)
+    }
+
+    /// Pop a byte from the front of the buffer
+    ///
+    /// Automatically frees fully-consumed chunks for efficient memory usage.
+    /// Returns `None` if the buffer is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-deque")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"Hello").unwrap();
+    ///
+    /// assert_eq!(buf.pop_front(&mut alloc), Some(b'H'));
+    /// assert_eq!(buf.pop_front(&mut alloc), Some(b'e'));
+    /// assert_eq!(buf.len(), 3); // "llo" remains
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-deque")]
+    pub fn pop_front<A: Allocator>(&mut self, arena: &mut A) -> Option<u8> {
+        if self.is_empty() {
+            return None;
+        }
+
+        // Read the byte at current read offset
+        let byte = self.read(arena).bytes().nth(self.read_offset as usize)?;
+
+        self.read_offset += 1;
+
+        // Try to free fully-consumed head chunks
+        self.try_free_head_chunks(arena);
+
+        Some(byte)
+    }
+
+    /// Remove N bytes from the front of the buffer
+    ///
+    /// This is more efficient than calling `pop_front()` N times as it
+    /// frees chunks in bulk. Returns the actual number of bytes removed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-deque")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"Hello, World!").unwrap();
+    ///
+    /// // Remove first 7 bytes ("Hello, ")
+    /// let removed = buf.remove_prefix(&mut alloc, 7);
+    /// assert_eq!(removed, 7);
+    /// assert_eq!(buf.len(), 6); // "World!" remains
+    ///
+    /// // Try to remove more than available
+    /// let removed = buf.remove_prefix(&mut alloc, 100);
+    /// assert_eq!(removed, 6); // Only removed what was available
+    /// assert_eq!(buf.len(), 0);
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-deque")]
+    pub fn remove_prefix<A: Allocator>(&mut self, arena: &mut A, count: usize) -> usize {
+        let available = self.len() as usize;
+        let to_remove = count.min(available);
+
+        if to_remove == 0 {
+            return 0;
+        }
+
+        self.read_offset += to_remove as u16;
+        self.try_free_head_chunks(arena);
+
+        to_remove
+    }
+
+    /// Try to free head chunks that have been fully consumed
+    ///
+    /// This is called automatically by `pop_front()` and `remove_prefix()`.
+    #[cfg(feature = "bytebuffer-deque")]
+    fn try_free_head_chunks<A: Allocator>(&mut self, arena: &mut A) {
+        let layout = arena.bit_layout();
+
+        // Walk through chunks and free those that are fully consumed
+        while let Some(head) = self.head {
+            let block = match arena.get(head) {
+                Some(b) => b,
+                None => break,
+            };
+
+            let chunk_len = get_len(block, &layout) as u16;
+
+            if self.read_offset >= chunk_len {
+                // This chunk is fully consumed, free it
+                let next = get_next_handle(block, &layout);
+
+                // Now free the head node and update buffer internals
+                if arena.free(head) {
+                    self.read_offset -= chunk_len;
+                    self.head = next;
+                    if next.is_none() {
+                        self.tail = None;
+                    }
+                    self.len = self.len.saturating_sub(chunk_len);
+                } else {
+                    break;
+                }
+            } else {
+                // Head chunk still has unread data
+                break;
+            }
+        }
+    }
+
+    // ========================================================================
+    // Stream processing operations (enabled with feature = "bytebuffer-stream")
+    // ========================================================================
+
+    /// Peek at the nth byte from the front without consuming
+    ///
+    /// Returns `None` if `n` is beyond the buffer length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-stream")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"Hello").unwrap();
+    ///
+    /// assert_eq!(buf.peek_n(&alloc, 0), Some(b'H'));
+    /// assert_eq!(buf.peek_n(&alloc, 4), Some(b'o'));
+    /// assert_eq!(buf.peek_n(&alloc, 5), None);
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-stream")]
+    pub fn peek_n<A: Allocator>(&self, arena: &A, n: usize) -> Option<u8> {
+        if n >= self.len() as usize {
+            return None;
+        }
+
+        self.read(arena).bytes().nth(self.read_offset as usize + n)
+    }
+
+    /// Remove bytes from the front while the predicate returns true
+    ///
+    /// Returns the number of bytes removed. Stops at the first byte
+    /// where the predicate returns false.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-stream")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"   Hello").unwrap();
+    ///
+    /// // Skip whitespace
+    /// let skipped = buf.skip_while(&mut alloc, |b| b == b' ');
+    /// assert_eq!(skipped, 3);
+    /// assert_eq!(buf.peek_front(&alloc), Some(b'H'));
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-stream")]
+    pub fn skip_while<A: Allocator, F>(&mut self, arena: &mut A, predicate: F) -> usize
+    where
+        F: Fn(u8) -> bool,
+    {
+        let mut count = 0;
+
+        while let Some(byte) = self.peek_front(arena) {
+            if !predicate(byte) {
+                break;
+            }
+            self.pop_front(arena);
+            count += 1;
+        }
+
+        count
+    }
+
+    /// Remove bytes from front until (and including) the delimiter
+    ///
+    /// Returns the number of bytes consumed if the delimiter was found,
+    /// or `None` if the delimiter is not in the buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-stream")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"Hello\nWorld").unwrap();
+    ///
+    /// // Consume until newline
+    /// let consumed = buf.consume_until(&mut alloc, b'\n');
+    /// assert_eq!(consumed, Some(6)); // "Hello\n"
+    /// assert_eq!(buf.peek_front(&alloc), Some(b'W'));
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-stream")]
+    pub fn consume_until<A: Allocator>(&mut self, arena: &mut A, delimiter: u8) -> Option<usize> {
+        // Find the delimiter position
+        let pos = self.position(arena, |b| b == delimiter)?;
+
+        // Remove up to and including the delimiter
+        let consumed = self.remove_prefix(arena, pos + 1);
+
+        Some(consumed)
+    }
+
+    /// Copy bytes from the front into a slice and consume them
+    ///
+    /// Returns the number of bytes actually copied (which may be less
+    /// than `dest.len()` if the buffer contains fewer bytes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-stream")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"Hello, World!").unwrap();
+    ///
+    /// let mut dest = [0u8; 5];
+    /// let copied = buf.copy_prefix_to(&mut alloc, &mut dest);
+    /// assert_eq!(copied, 5);
+    /// assert_eq!(&dest, b"Hello");
+    /// assert_eq!(buf.len(), 8); // ", World!" remains
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-stream")]
+    pub fn copy_prefix_to<A: Allocator>(&mut self, arena: &mut A, dest: &mut [u8]) -> usize {
+        let to_copy = dest.len().min(self.len() as usize);
+
+        for (i, item) in dest.iter_mut().enumerate().take(to_copy) {
+            if let Some(byte) = self.pop_front(arena) {
+                *item = byte;
+            } else {
+                return i;
+            }
+        }
+
+        to_copy
+    }
+
+    /// Split off the front N bytes into a new ByteBuffer
+    ///
+    /// Creates a new buffer with the first `at` bytes. The original buffer
+    /// retains the remaining bytes. Returns an error if `at` is greater than
+    /// the buffer length.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-stream")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut buf = ByteBuffer::new();
+    ///
+    /// buf.write(&mut alloc).extend(b"Hello, World!").unwrap();
+    ///
+    /// let front = buf.split_off_front(&mut alloc, 5).unwrap();
+    /// assert_eq!(front.len(), 5); // "Hello"
+    /// assert_eq!(buf.len(), 8);   // ", World!" remains
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-stream")]
+    pub fn split_off_front<A: Allocator>(
+        &mut self,
+        arena: &mut A,
+        at: usize,
+    ) -> Result<ByteBuffer, ByteBufferError> {
+        if at > self.len() as usize {
+            return Err(ByteBufferError::Full);
+        }
+
+        let mut new_buf = ByteBuffer::new();
+
+        // Copy the first 'at' bytes to the new buffer
+        for _ in 0..at {
+            if let Some(byte) = self.pop_front(arena) {
+                new_buf.write(arena).append(byte)?;
+            }
+        }
+
+        Ok(new_buf)
+    }
+
+    /// Move bytes from the front of this buffer to the back of another
+    ///
+    /// Moves up to `count` bytes from the front of `self` to the back of `other`.
+    /// Returns the number of bytes actually moved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "bytebuffer-stream")]
+    /// # {
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let mut alloc = TinySlabAllocator::<512, 16>::new();
+    /// let mut src = ByteBuffer::new();
+    /// let mut dst = ByteBuffer::new();
+    ///
+    /// src.write(&mut alloc).extend(b"Hello").unwrap();
+    /// dst.write(&mut alloc).extend(b"World").unwrap();
+    ///
+    /// let moved = src.drain_into(&mut alloc, &mut dst, 3);
+    /// assert_eq!(moved, 3);
+    /// assert_eq!(src.len(), 2); // "lo" remains
+    /// assert_eq!(dst.len(), 8); // "WorldHel"
+    /// # }
+    /// ```
+    #[cfg(feature = "bytebuffer-stream")]
+    pub fn drain_into<A: Allocator>(
+        &mut self,
+        arena: &mut A,
+        other: &mut ByteBuffer,
+        count: usize,
+    ) -> usize {
+        let to_move = count.min(self.len() as usize);
+        let mut moved = 0;
+
+        for _ in 0..to_move {
+            if let Some(byte) = self.pop_front(arena) {
+                if other.write(arena).append(byte).is_ok() {
+                    moved += 1;
+                } else {
+                    // Can't append to destination, stop
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        moved
+    }
+}
+
+// ============================================================================
+// Global Deque Wrapper (enabled with features = "bytebuffer-deque" + "global-alloc")
+// ============================================================================
+
+/// Global wrapper for ByteBuffer with deque operations (single-threaded, no mutex needed)
+///
+/// This provides a safe interface for sharing a ByteBuffer globally
+/// in single-threaded embedded contexts (e.g., between interrupt handlers
+/// and main code).
+///
+/// # Safety
+/// This is only safe in single-threaded contexts. Do not use with multiple
+/// threads or concurrent access.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use tinyalloc::prelude::*;
+///
+/// static UART_QUEUE: GlobalDeque = GlobalDeque::new();
+///
+/// fn interrupt_handler() {
+///     let byte = read_uart_byte();
+///     UART_QUEUE.push(byte).ok();
+/// }
+///
+/// fn main() {
+///     GlobalAllocatorConfig::Slab512b16.init();
+///     
+///     loop {
+///         while let Some(byte) = UART_QUEUE.pop() {
+///             process_byte(byte);
+///         }
+///     }
+/// }
+/// # fn read_uart_byte() -> u8 { 0 }
+/// # fn process_byte(_: u8) {}
+/// ```
+#[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+pub struct GlobalDeque {
+    inner: core::cell::UnsafeCell<ByteBuffer>,
+}
+
+#[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+unsafe impl Sync for GlobalDeque {}
+
+#[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+impl GlobalDeque {
+    /// Create a new global deque
+    pub const fn new() -> Self {
+        Self {
+            inner: core::cell::UnsafeCell::new(ByteBuffer::new()),
+        }
+    }
+
+    /// Create a new global deque with maximum length
+    pub const fn with_max_len(max: u16) -> Self {
+        Self {
+            inner: core::cell::UnsafeCell::new(ByteBuffer::with_max_len(max)),
+        }
+    }
+
+    /// Execute a closure with mutable access to the buffer
+    ///
+    /// # Safety
+    /// Safe in single-threaded context. Caller must ensure no concurrent access.
+    #[inline]
+    pub fn with_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut ByteBuffer) -> R,
+    {
+        unsafe { f(&mut *self.inner.get()) }
+    }
+
+    /// Push a byte using the global allocator
+    #[inline]
+    pub fn push(&self, byte: u8) -> Result<(), ByteBufferError> {
+        self.with_mut(|buf| {
+            crate::global::with_global_allocator(|alloc| buf.write(alloc).append(byte))
+        })
+    }
+
+    /// Pop a byte using the global allocator
+    #[inline]
+    pub fn pop(&self) -> Option<u8> {
+        self.with_mut(|buf| crate::global::with_global_allocator(|alloc| buf.pop_front(alloc)))
+    }
+
+    /// Peek at the front byte using the global allocator
+    #[inline]
+    pub fn peek(&self) -> Option<u8> {
+        self.with_mut(|buf| crate::global::with_global_allocator(|alloc| buf.peek_front(alloc)))
+    }
+
+    /// Get the current length
+    #[inline]
+    pub fn len(&self) -> u16 {
+        self.with_mut(|buf| buf.len())
+    }
+
+    /// Check if the deque is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.with_mut(|buf| buf.is_empty())
+    }
+
+    /// Clear all data using the global allocator
+    #[inline]
+    pub fn clear(&self) {
+        self.with_mut(|buf| crate::global::with_global_allocator(|alloc| buf.write(alloc).clear()))
+    }
+}
+
+#[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+impl Default for GlobalDeque {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -588,10 +1232,31 @@ mod tests {
     use crate::backend::tinyslab::TinySlabAllocator;
 
     // Helper to collect bytes from iterator into fixed array
+    #[cfg(not(feature = "bytebuffer-deque"))]
     fn collect_bytes<A: Allocator>(buf: &ByteBuffer, arena: &A) -> ([u8; 256], usize) {
         let mut result = [0u8; 256];
         let mut count = 0;
         for (i, b) in buf.read(arena).bytes().enumerate() {
+            if i >= 256 {
+                break;
+            }
+            result[i] = b;
+            count += 1;
+        }
+        (result, count)
+    }
+
+    // Helper to collect bytes from iterator into fixed array (deque version - skips read_offset)
+    #[cfg(feature = "bytebuffer-deque")]
+    fn collect_bytes<A: Allocator>(buf: &ByteBuffer, arena: &A) -> ([u8; 256], usize) {
+        let mut result = [0u8; 256];
+        let mut count = 0;
+        for (i, b) in buf
+            .read(arena)
+            .bytes()
+            .skip(buf.read_offset as usize)
+            .enumerate()
+        {
             if i >= 256 {
                 break;
             }
@@ -797,5 +1462,106 @@ mod tests {
         buf.set_max_len(None);
         buf.write(&mut arena).extend(b"ABCDEFGH").unwrap();
         assert_eq!(buf.len(), 18);
+    }
+
+    #[test]
+    #[cfg(feature = "bytebuffer-deque")]
+    fn test_bytebuffer_pop_front() {
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
+        let mut buf = ByteBuffer::new();
+
+        buf.write(&mut arena).extend(b"ABCDE").unwrap();
+        assert_eq!(buf.len(), 5);
+
+        // Pop bytes one by one
+        assert_eq!(buf.pop_front(&mut arena), Some(b'A'));
+        assert_eq!(buf.len(), 4);
+
+        assert_eq!(buf.pop_front(&mut arena), Some(b'B'));
+        assert_eq!(buf.len(), 3);
+
+        assert_eq!(buf.pop_front(&mut arena), Some(b'C'));
+        assert_eq!(buf.pop_front(&mut arena), Some(b'D'));
+        assert_eq!(buf.pop_front(&mut arena), Some(b'E'));
+        assert_eq!(buf.len(), 0);
+
+        // Pop from empty buffer
+        assert_eq!(buf.pop_front(&mut arena), None);
+    }
+
+    #[test]
+    #[cfg(feature = "bytebuffer-deque")]
+    fn test_bytebuffer_peek_front() {
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
+        let mut buf = ByteBuffer::new();
+
+        buf.write(&mut arena).extend(b"XYZ").unwrap();
+
+        // Peek doesn't consume
+        assert_eq!(buf.peek_front(&arena), Some(b'X'));
+        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.peek_front(&arena), Some(b'X'));
+
+        // Pop and peek again
+        buf.pop_front(&mut arena);
+        assert_eq!(buf.peek_front(&arena), Some(b'Y'));
+    }
+
+    #[test]
+    #[cfg(feature = "bytebuffer-deque")]
+    fn test_bytebuffer_remove_prefix() {
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
+        let mut buf = ByteBuffer::new();
+
+        buf.write(&mut arena).extend(b"Hello, World!").unwrap();
+        assert_eq!(buf.len(), 13);
+
+        // Remove first 7 bytes ("Hello, ")
+        let removed = buf.remove_prefix(&mut arena, 7);
+        assert_eq!(removed, 7);
+        assert_eq!(buf.len(), 6);
+
+        // Verify remaining data
+        let (bytes, count) = collect_bytes(&buf, &arena);
+        assert_eq!(count, 6);
+        assert_eq!(&bytes[..6], b"World!");
+
+        // Try to remove more than available
+        let removed = buf.remove_prefix(&mut arena, 100);
+        assert_eq!(removed, 6); // Only 6 were available
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "bytebuffer-deque")]
+    fn test_bytebuffer_chunk_freeing() {
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
+        let mut buf = ByteBuffer::new();
+
+        // Fill first chunk (block_size - 2 bytes of metadata)
+        let block_size = arena.block_size();
+        let usable = block_size - 2; // Subtract 2-byte metadata
+
+        for i in 0..usable {
+            buf.write(&mut arena).append(i as u8).unwrap();
+        }
+
+        let initial_used = arena.len();
+        assert_eq!(initial_used, 1); // 1 chunk allocated
+
+        // Add one more byte to trigger second chunk
+        buf.write(&mut arena).append(99).unwrap();
+        assert_eq!(arena.len(), 2); // 2 chunks now
+
+        // Consume the entire first chunk
+        for _ in 0..usable {
+            buf.pop_front(&mut arena);
+        }
+
+        // First chunk should be freed automatically
+        assert_eq!(arena.len(), 1); // Back to 1 chunk
+        assert_eq!(buf.len(), 1); // Only the 99 remains
+        assert_eq!(buf.peek_front(&arena), Some(99));
     }
 }

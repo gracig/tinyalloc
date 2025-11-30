@@ -18,14 +18,17 @@ path = "src/allocator.rs"
 crate-type = ["rlib"]
 
 [dependencies]
+nom = { version = "8", optional = true, default-features = false }
 
 [features]
-default = ["tinyslab", "bytebuffer", "global-alloc","bytebuffer-deque","global-alloc-custom"]
+default = ["tinyslab", "bytebuffer", "global-alloc", "bytebuffer-deque", "bytebuffer-stream", "global-alloc-custom", "nominput"]
 tinyslab = []
 bytebuffer = []
 bytebuffer-deque = ["bytebuffer"]
+bytebuffer-stream = ["bytebuffer-deque"]
 global-alloc = ["tinyslab", "bytebuffer"]
 global-alloc-custom = ["global-alloc"]
+nominput = ["bytebuffer", "nom"]
 
 [profile.release]
 opt-level = "z"     # Optimize for size

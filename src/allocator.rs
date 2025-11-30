@@ -73,13 +73,11 @@
 //! - Linked-list of chunks from allocator
 //! - Zero-copy operations where possible
 //! - Optional maximum length enforcement
+//! - With `bytebuffer-deque` feature: FIFO operations (push back, pop front)
+//! - Automatic chunk memory reclamation
+//! - Perfect for UART/SPI buffers and stream processing
 //!
-//! **ByteBufferDeque** - Stream processing:
-//! - Push to back, pop from front
-//! - Automatic memory reclamation
-//! - Perfect for UART/SPI buffers
-//!
-//! **GlobalDeque** - Single-threaded global access:
+//! **GlobalDeque** - Single-threaded global access (requires `bytebuffer-deque` + `global-alloc`):
 //! - Static lifetime for interrupt handlers
 //! - No mutex overhead
 //! - Ideal for producer/consumer patterns

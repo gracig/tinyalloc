@@ -116,12 +116,14 @@ fn main() {
     println!("--- Final Statistics ---");
     SHARED_DEQUE.with_mut(|deque| {
         println!("Deque length: {}", deque.len());
-        println!("Total written: {}", deque.total_written());
-        println!("Total read: {}", deque.total_read());
     });
 
     with_global_allocator(|alloc| {
-        println!("Allocator used: {} / {} slots", alloc.len(), alloc.capacity());
+        println!(
+            "Allocator used: {} / {} slots",
+            alloc.len(),
+            alloc.capacity()
+        );
     });
 
     println!("\n=== Pattern Demonstrated ===");

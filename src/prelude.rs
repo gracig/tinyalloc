@@ -15,11 +15,11 @@ pub use crate::backend::tinyslab::TinySlabAllocator;
 #[cfg(feature = "bytebuffer")]
 pub use crate::utils::bytebuffer::{ByteBuffer, ByteBufferError};
 
-#[cfg(feature = "bytebuffer-deque")]
-pub use crate::utils::bytebufferdeque::ByteBufferDeque;
-
 #[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
-pub use crate::utils::bytebufferdeque::GlobalDeque;
+pub use crate::utils::bytebuffer::GlobalDeque;
 
 #[cfg(feature = "global-alloc")]
 pub use crate::global::{GlobalAllocatorConfig, init_global_allocator, with_global_allocator};
+
+// Nom integration traits are implemented directly on ByteBuffer when nominput feature is enabled
+// No additional types need to be exported

@@ -315,15 +315,22 @@ mod tests {
             init_global_allocator(&mut *(core::ptr::addr_of_mut!(ALLOC)));
         }
 
-        with_global_allocator(|alloc| {
-            alloc.clear();
+        with_global_allocator(|_alloc| {
+            // Note: Don't clear() here as other tests might be using the global allocator
 
             // Create buffer and try to append
             let mut buf = ByteBuffer::new();
             let result = buf.append(42);
 
-            assert!(result.is_ok(), "ByteBuffer append should succeed");
+            assert!(
+                result.is_ok(),
+                "ByteBuffer append should succeed, got: {:?}",
+                result
+            );
             assert_eq!(buf.len(), 1);
+
+            // Cleanup
+            buf.clear();
         });
     }
 
