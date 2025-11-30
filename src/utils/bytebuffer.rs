@@ -503,6 +503,71 @@ impl ByteBuffer {
     }
 
     // ========================================================================
+    // Deque-style operations - Global API (enabled with features)
+    // ========================================================================
+
+    /// Peek at the front byte without consuming it (global allocator version)
+    #[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+    pub fn peek_front_global(&self) -> Option<u8> {
+        crate::global::with_global_allocator(|alloc| self.peek_front(alloc))
+    }
+
+    /// Pop a byte from the front of the buffer (global allocator version)
+    #[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+    pub fn pop_front_global(&mut self) -> Option<u8> {
+        crate::global::with_global_allocator(|alloc| self.pop_front(alloc))
+    }
+
+    /// Remove N bytes from the front of the buffer (global allocator version)
+    #[cfg(all(feature = "bytebuffer-deque", feature = "global-alloc"))]
+    pub fn remove_prefix_global(&mut self, count: usize) -> usize {
+        crate::global::with_global_allocator(|alloc| self.remove_prefix(alloc, count))
+    }
+
+    // ========================================================================
+    // Stream processing operations - Global API (enabled with features)
+    // ========================================================================
+
+    /// Peek at the nth byte from the front (global allocator version)
+    #[cfg(all(feature = "bytebuffer-stream", feature = "global-alloc"))]
+    pub fn peek_n_global(&self, n: usize) -> Option<u8> {
+        crate::global::with_global_allocator(|alloc| self.peek_n(alloc, n))
+    }
+
+    /// Remove bytes from the front while predicate is true (global allocator version)
+    #[cfg(all(feature = "bytebuffer-stream", feature = "global-alloc"))]
+    pub fn skip_while_global<F>(&mut self, predicate: F) -> usize
+    where
+        F: Fn(u8) -> bool,
+    {
+        crate::global::with_global_allocator(|alloc| self.skip_while(alloc, predicate))
+    }
+
+    /// Remove bytes until delimiter is found (global allocator version)
+    #[cfg(all(feature = "bytebuffer-stream", feature = "global-alloc"))]
+    pub fn consume_until_global(&mut self, delimiter: u8) -> Option<usize> {
+        crate::global::with_global_allocator(|alloc| self.consume_until(alloc, delimiter))
+    }
+
+    /// Copy bytes from front into slice and consume them (global allocator version)
+    #[cfg(all(feature = "bytebuffer-stream", feature = "global-alloc"))]
+    pub fn copy_prefix_to_global(&mut self, dest: &mut [u8]) -> usize {
+        crate::global::with_global_allocator(|alloc| self.copy_prefix_to(alloc, dest))
+    }
+
+    /// Split off the front N bytes into a new ByteBuffer (global allocator version)
+    #[cfg(all(feature = "bytebuffer-stream", feature = "global-alloc"))]
+    pub fn split_off_front_global(&mut self, at: usize) -> Result<ByteBuffer, ByteBufferError> {
+        crate::global::with_global_allocator(|alloc| self.split_off_front(alloc, at))
+    }
+
+    /// Move bytes from front to back of another buffer (global allocator version)
+    #[cfg(all(feature = "bytebuffer-stream", feature = "global-alloc"))]
+    pub fn drain_into_global(&mut self, other: &mut ByteBuffer, count: usize) -> usize {
+        crate::global::with_global_allocator(|alloc| self.drain_into(alloc, other, count))
+    }
+
+    // ========================================================================
     // Deque-style operations (enabled with feature = "bytebuffer-deque")
     // ========================================================================
 
