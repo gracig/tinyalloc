@@ -94,9 +94,6 @@
 use super::bytebuffer::{ByteBuffer, ByteBufferError};
 use crate::Allocator;
 
-extern crate alloc;
-use alloc::vec::Vec;
-
 /// A double-ended queue backed by ByteBuffer
 ///
 /// Provides efficient FIFO operations with automatic memory management.
@@ -236,15 +233,6 @@ impl ByteBufferDeque {
     pub fn clear<A: Allocator>(&mut self, arena: &mut A) {
         self.buffer.write(arena).clear();
         self.read_offset = 0;
-    }
-
-    /// Collect available bytes into a Vec (from read_offset onwards)
-    pub fn to_vec<A: Allocator>(&self, arena: &A) -> Vec<u8> {
-        self.buffer
-            .read(arena)
-            .bytes()
-            .skip(self.read_offset as usize)
-            .collect()
     }
 
     /// Drain all available bytes into a new ByteBuffer
@@ -476,12 +464,17 @@ mod tests {
         deque.extend(&mut arena, b" World").unwrap();
         assert_eq!(deque.len(), 9); // "llo World"
 
-        // Pop rest
-        let mut result = Vec::new();
-        while let Some(b) = deque.pop_front(&mut arena) {
-            result.push(b);
-        }
-        assert_eq!(&result, b"llo World");
+        // Pop and verify each byte
+        assert_eq!(deque.pop_front(&mut arena), Some(b'l'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'l'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'o'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b' '));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'W'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'o'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'r'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'l'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'd'));
+        assert!(deque.is_empty());
     }
 
     #[test]
@@ -493,8 +486,11 @@ mod tests {
         deque.pop_front(&mut arena); // Remove '1'
         deque.pop_front(&mut arena); // Remove '2'
 
-        let collected = deque.to_vec(&arena);
-        assert_eq!(&collected, b"345");
+        // Verify remaining bytes
+        assert_eq!(deque.pop_front(&mut arena), Some(b'3'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'4'));
+        assert_eq!(deque.pop_front(&mut arena), Some(b'5'));
+        assert!(deque.is_empty());
     }
 
     #[test]
@@ -560,7 +556,15 @@ mod tests {
         assert!(deque.is_empty());
         assert_eq!(drained.len(), 7); // "rain me"
 
-        let collected: Vec<u8> = drained.read(&arena).bytes().collect();
-        assert_eq!(&collected, b"rain me");
+        // Verify drained content byte by byte
+        let mut bytes = drained.read(&arena).bytes();
+        assert_eq!(bytes.next(), Some(b'r'));
+        assert_eq!(bytes.next(), Some(b'a'));
+        assert_eq!(bytes.next(), Some(b'i'));
+        assert_eq!(bytes.next(), Some(b'n'));
+        assert_eq!(bytes.next(), Some(b' '));
+        assert_eq!(bytes.next(), Some(b'm'));
+        assert_eq!(bytes.next(), Some(b'e'));
+        assert_eq!(bytes.next(), None);
     }
 }
