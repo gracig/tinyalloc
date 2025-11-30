@@ -33,16 +33,15 @@
 //! assert_eq!(deque.len(), 2);
 //!
 //! // Pop data
-//! assert_eq!(deque.pop_front(&alloc), Some(b'H'));
-//! assert_eq!(deque.pop_front(&alloc), Some(b'i'));
-//! assert_eq!(deque.pop_front(&alloc), None);
+//! assert_eq!(deque.pop_front(&mut alloc), Some(b'H'));
+//! assert_eq!(deque.pop_front(&mut alloc), Some(b'i'));
+//! assert_eq!(deque.pop_front(&mut alloc), None);
 //! ```
 //!
 //! ## With Global Allocator (Interrupt Pattern)
 //!
 //! ```rust,no_run
 //! use tinyalloc::prelude::*;
-//! use tinyalloc::global::AllocatorConfig;
 //!
 //! static UART_QUEUE: GlobalDeque = GlobalDeque::new();
 //!
@@ -52,7 +51,7 @@
 //! }
 //!
 //! fn main() {
-//!     AllocatorConfig::Slab512b16.init();
+//!     GlobalAllocatorConfig::Slab512b16.init();
 //!     
 //!     loop {
 //!         while let Some(byte) = UART_QUEUE.pop() {
@@ -84,7 +83,7 @@
 //!
 //! // Consume first chunk completely
 //! for _ in 0..30 {
-//!     deque.pop_front(&alloc);
+//!     deque.pop_front(&mut alloc);
 //! }
 //!
 //! // First chunk automatically freed

@@ -15,17 +15,21 @@ fn main() {
 
     // Initialize with CUSTOM size (4KB instead of default 2KB)
     println!("Initializing custom allocator (4KB, 128 slots)...");
-    init_global_allocator(CustomAllocator::new());
+    static mut CUSTOM_ALLOC: CustomAllocator = CustomAllocator::new();
+    unsafe {
+        init_global_allocator(&mut *(core::ptr::addr_of_mut!(CUSTOM_ALLOC)));
+    }
 
     // Verify the custom configuration
-    let alloc_stats = stats();
-    println!("Custom allocator initialized:");
-    println!("  Capacity: {} slots", alloc_stats.capacity);
-    println!("  Block size: {} bytes", alloc_stats.block_size);
-    println!(
-        "  Total memory: {} bytes\n",
-        alloc_stats.capacity * alloc_stats.block_size
-    );
+    with_global_allocator(|alloc| {
+        println!("Custom allocator initialized:");
+        println!("  Capacity: {} slots", alloc.capacity());
+        println!("  Block size: {} bytes", alloc.block_size());
+        println!(
+            "  Total memory: {} bytes\n",
+            alloc.capacity() * alloc.block_size()
+        );
+    });
 
     // Now we can allocate more data than the default would allow
     let mut buf = ByteBuffer::new();
@@ -35,7 +39,9 @@ fn main() {
     buf.extend(&large_data).unwrap();
 
     println!("Allocated {} bytes successfully!", buf.len());
-    println!("  Used slots: {}", stats().used);
+    with_global_allocator(|alloc| {
+        println!("  Used slots: {}", alloc.len());
+    });
 
     // Create multiple buffers to show capacity
     let mut buffers = Vec::new();
@@ -46,11 +52,9 @@ fn main() {
     }
 
     println!("\nCreated {} additional buffers", buffers.len());
-    println!(
-        "  Total used slots: {}/{}",
-        stats().used,
-        stats().capacity
-    );
+    with_global_allocator(|alloc| {
+        println!("  Total used slots: {}/{}", alloc.len(), alloc.capacity());
+    });
 
     // Cleanup
     buf.clear();
@@ -59,7 +63,9 @@ fn main() {
     }
 
     println!("\n✓ All buffers cleaned up!");
-    println!("  Final used slots: {}", stats().used);
+    with_global_allocator(|alloc| {
+        println!("  Final used slots: {}", alloc.len());
+    });
 
     println!("\n=== Key Takeaway ===");
     println!("Users can define their own allocator size in their main()");

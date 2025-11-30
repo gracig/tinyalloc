@@ -14,11 +14,12 @@ fn main() {
     GlobalAllocatorConfig::Slab1K32.init();
 
     // Get initial stats
-    let alloc_stats = stats();
-    println!("Initial allocator state:");
-    println!("  Capacity: {} slots", alloc_stats.capacity);
-    println!("  Used: {} slots", alloc_stats.used);
-    println!("  Block size: {} bytes\n", alloc_stats.block_size);
+    with_global_allocator(|alloc| {
+        println!("Initial allocator state:");
+        println!("  Capacity: {} slots", alloc.capacity());
+        println!("  Used: {} slots", alloc.len());
+        println!("  Block size: {} bytes\n", alloc.block_size());
+    });
 
     // STEP 2: Use ByteBuffer with simplified API
     let mut buf = ByteBuffer::new();
@@ -35,8 +36,9 @@ fn main() {
     }
     println!();
 
-    let alloc_stats = stats();
-    println!("  Allocator used: {} slots\n", alloc_stats.used);
+    with_global_allocator(|alloc| {
+        println!("  Allocator used: {} slots\n", alloc.len());
+    });
 
     // Create another buffer
     let mut buf2 = ByteBuffer::new();
@@ -49,10 +51,9 @@ fn main() {
         print!("{}", byte as char);
     }
     println!();
-    println!(
-        "  Allocator used: {} slots\n",
-        stats().used
-    );
+    with_global_allocator(|alloc| {
+        println!("  Allocator used: {} slots\n", alloc.len());
+    });
 
     // Combine buffers
     let mut buf3 = ByteBuffer::new();
@@ -66,20 +67,18 @@ fn main() {
         print!("{}", byte as char);
     }
     println!();
-    println!(
-        "  Allocator used: {} slots\n",
-        stats().used
-    );
+    with_global_allocator(|alloc| {
+        println!("  Allocator used: {} slots\n", alloc.len());
+    });
 
     // Manual cleanup
     println!("Cleaning up buffers...");
     buf.clear();
     buf2.clear();
     buf3.clear();
-    println!(
-        "  Allocator used after cleanup: {} slots\n",
-        stats().used
-    );
+    with_global_allocator(|alloc| {
+        println!("  Allocator used after cleanup: {} slots\n", alloc.len());
+    });
 
     println!("✓ All memory manually freed!");
 }

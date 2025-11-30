@@ -58,9 +58,10 @@ fn main() {
     println!("Initializing global allocator (512 bytes, 16-byte blocks)...");
     GlobalAllocatorConfig::Slab512b16.init();
 
-    let alloc_stats = stats();
-    println!("  Capacity: {} slots", alloc_stats.capacity);
-    println!("  Block size: {} bytes", alloc_stats.block_size);
+    with_global_allocator(|alloc| {
+        println!("  Capacity: {} slots", alloc.capacity());
+        println!("  Block size: {} bytes", alloc.block_size());
+    });
     println!();
 
     // Simulate embedded system main loop
@@ -119,8 +120,9 @@ fn main() {
         println!("Total read: {}", deque.total_read());
     });
 
-    let alloc_stats = stats();
-    println!("Allocator used: {} / {} slots", alloc_stats.used, alloc_stats.capacity);
+    with_global_allocator(|alloc| {
+        println!("Allocator used: {} / {} slots", alloc.len(), alloc.capacity());
+    });
 
     println!("\n=== Pattern Demonstrated ===");
     println!("✓ Global allocator initialized once");

@@ -61,11 +61,6 @@
 use crate::backend::tinyslab::TinySlabAllocator;
 use crate::{Allocator, Handle};
 use core::cell::UnsafeCell;
-use core::mem::{MaybeUninit, size_of};
-use core::ptr;
-
-/// Maximum allocator size that can be stored
-const MAX_ALLOC_SIZE: usize = 8192;
 
 /// Predefined allocator configurations
 #[derive(Debug, Clone, Copy)]
@@ -98,76 +93,39 @@ pub enum GlobalAllocatorConfig {
 
 impl GlobalAllocatorConfig {
     /// Initialize the global allocator with this configuration
+    ///
+    /// Creates a static allocator internally for the selected configuration
     pub fn init(self) {
+        macro_rules! init_static {
+            ($size:expr, $slots:expr) => {{
+                static mut ALLOC: TinySlabAllocator<$size, $slots> = TinySlabAllocator::new();
+                unsafe {
+                    let alloc_ptr = core::ptr::addr_of_mut!(ALLOC);
+                    init_global_allocator(&mut *alloc_ptr)
+                }
+            }};
+        }
         match self {
-            GlobalAllocatorConfig::Slab256b32 => {
-                init_global_allocator(TinySlabAllocator::<256, 8>::new())
-            }
-            GlobalAllocatorConfig::Slab256b16 => {
-                init_global_allocator(TinySlabAllocator::<256, 16>::new())
-            }
-            GlobalAllocatorConfig::Slab256b8 => {
-                init_global_allocator(TinySlabAllocator::<256, 32>::new())
-            }
-            GlobalAllocatorConfig::Slab512b32 => {
-                init_global_allocator(TinySlabAllocator::<512, 16>::new())
-            }
-            GlobalAllocatorConfig::Slab512b16 => {
-                init_global_allocator(TinySlabAllocator::<512, 32>::new())
-            }
-            GlobalAllocatorConfig::Slab512b8 => {
-                init_global_allocator(TinySlabAllocator::<512, 64>::new())
-            }
-            GlobalAllocatorConfig::Slab768b32 => {
-                init_global_allocator(TinySlabAllocator::<768, 24>::new())
-            }
-            GlobalAllocatorConfig::Slab768b16 => {
-                init_global_allocator(TinySlabAllocator::<768, 48>::new())
-            }
-            GlobalAllocatorConfig::Slab768b8 => {
-                init_global_allocator(TinySlabAllocator::<768, 96>::new())
-            }
-            GlobalAllocatorConfig::Slab1K32 => {
-                init_global_allocator(TinySlabAllocator::<1024, 32>::new())
-            }
-            GlobalAllocatorConfig::Slab1K16 => {
-                init_global_allocator(TinySlabAllocator::<1024, 64>::new())
-            }
-            GlobalAllocatorConfig::Slab1K8 => {
-                init_global_allocator(TinySlabAllocator::<1024, 128>::new())
-            }
+            GlobalAllocatorConfig::Slab256b32 => init_static!(256, 8),
+            GlobalAllocatorConfig::Slab256b16 => init_static!(256, 16),
+            GlobalAllocatorConfig::Slab256b8 => init_static!(256, 32),
+            GlobalAllocatorConfig::Slab512b32 => init_static!(512, 16),
+            GlobalAllocatorConfig::Slab512b16 => init_static!(512, 32),
+            GlobalAllocatorConfig::Slab512b8 => init_static!(512, 64),
+            GlobalAllocatorConfig::Slab768b32 => init_static!(768, 24),
+            GlobalAllocatorConfig::Slab768b16 => init_static!(768, 48),
+            GlobalAllocatorConfig::Slab768b8 => init_static!(768, 96),
+            GlobalAllocatorConfig::Slab1K32 => init_static!(1024, 32),
+            GlobalAllocatorConfig::Slab1K16 => init_static!(1024, 64),
+            GlobalAllocatorConfig::Slab1K8 => init_static!(1024, 128),
         }
     }
 }
 
-// Type aliases for complex function pointer types
-type AllocFn = unsafe fn(*mut u8, &[u8]) -> Option<Handle>;
-type AllocUninitFn = unsafe fn(*mut u8, usize) -> Option<(Handle, &'static mut [u8])>;
-type FreeFn = unsafe fn(*mut u8, Handle) -> bool;
-type GetFn = unsafe fn(*const u8, Handle) -> Option<&'static [u8]>;
-type GetMutFn = unsafe fn(*mut u8, Handle) -> Option<&'static mut [u8]>;
-type LenFn = unsafe fn(*const u8) -> usize;
-type CapacityFn = unsafe fn(*const u8) -> usize;
-type BlockSizeFn = unsafe fn(*const u8) -> usize;
-type BitLayoutFn = unsafe fn(*const u8) -> crate::BitLayout;
-type ClearFn = unsafe fn(*mut u8);
-
 /// Type-erased global allocator storage
 struct GlobalStorage {
-    /// Raw storage buffer for any allocator up to MAX_ALLOC_SIZE
-    storage: UnsafeCell<MaybeUninit<[u8; MAX_ALLOC_SIZE]>>,
-    /// Function pointers for dynamic dispatch (vtable)
-    /// UnsafeCell needed because init() mutates through &self (static context)
-    alloc_fn: UnsafeCell<Option<AllocFn>>,
-    alloc_uninit_fn: UnsafeCell<Option<AllocUninitFn>>,
-    free_fn: UnsafeCell<Option<FreeFn>>,
-    get_fn: UnsafeCell<Option<GetFn>>,
-    get_mut_fn: UnsafeCell<Option<GetMutFn>>,
-    len_fn: UnsafeCell<Option<LenFn>>,
-    capacity_fn: UnsafeCell<Option<CapacityFn>>,
-    block_size_fn: UnsafeCell<Option<BlockSizeFn>>,
-    bit_layout_fn: UnsafeCell<Option<BitLayoutFn>>,
-    clear_fn: UnsafeCell<Option<ClearFn>>,
+    /// Pointer to user's allocator (stored as dyn Allocator trait object)
+    allocator_ptr: UnsafeCell<Option<&'static mut dyn Allocator>>,
 }
 
 unsafe impl Sync for GlobalStorage {}
@@ -175,94 +133,14 @@ unsafe impl Sync for GlobalStorage {}
 impl GlobalStorage {
     const fn new() -> Self {
         Self {
-            storage: UnsafeCell::new(MaybeUninit::uninit()),
-            alloc_fn: UnsafeCell::new(None),
-            alloc_uninit_fn: UnsafeCell::new(None),
-            free_fn: UnsafeCell::new(None),
-            get_fn: UnsafeCell::new(None),
-            get_mut_fn: UnsafeCell::new(None),
-            len_fn: UnsafeCell::new(None),
-            capacity_fn: UnsafeCell::new(None),
-            block_size_fn: UnsafeCell::new(None),
-            bit_layout_fn: UnsafeCell::new(None),
-            clear_fn: UnsafeCell::new(None),
+            allocator_ptr: UnsafeCell::new(None),
         }
     }
 
-    fn init<A: Allocator + 'static>(&self, allocator: A) {
-        assert!(
-            size_of::<A>() <= MAX_ALLOC_SIZE,
-            "Allocator size {} exceeds MAX_ALLOC_SIZE {}",
-            size_of::<A>(),
-            MAX_ALLOC_SIZE
-        );
-
+    fn init<A: Allocator + 'static>(&self, allocator: &'static mut A) {
         unsafe {
-            // Write allocator into storage
-            let storage_ptr = (*self.storage.get()).as_mut_ptr() as *mut A;
-            ptr::write(storage_ptr, allocator);
-
-            // Setup function pointers
-            *self.alloc_fn.get() = Some(|ptr, data| {
-                let alloc = &mut *(ptr as *mut A);
-                Allocator::alloc(alloc, data)
-            });
-
-            *self.alloc_uninit_fn.get() = Some(|ptr, len| {
-                let alloc = &mut *(ptr as *mut A);
-                Allocator::alloc_uninit(alloc, len)
-            });
-
-            *self.free_fn.get() = Some(|ptr, handle| {
-                let alloc = &mut *(ptr as *mut A);
-                Allocator::free(alloc, handle)
-            });
-
-            *self.get_fn.get() = Some(|ptr, handle| {
-                let alloc = &*(ptr as *const A);
-                Allocator::get(alloc, handle)
-            });
-
-            *self.get_mut_fn.get() = Some(|ptr, handle| {
-                let alloc = &mut *(ptr as *mut A);
-                Allocator::get_mut(alloc, handle)
-            });
-
-            *self.len_fn.get() = Some(|ptr| {
-                let alloc = &*(ptr as *const A);
-                Allocator::len(alloc)
-            });
-
-            *self.capacity_fn.get() = Some(|ptr| {
-                let alloc = &*(ptr as *const A);
-                Allocator::capacity(alloc)
-            });
-
-            *self.block_size_fn.get() = Some(|ptr| {
-                let alloc = &*(ptr as *const A);
-                Allocator::block_size(alloc)
-            });
-
-            *self.bit_layout_fn.get() = Some(|ptr| {
-                let alloc = &*(ptr as *const A);
-                Allocator::bit_layout(alloc)
-            });
-
-            *self.clear_fn.get() = Some(|ptr| {
-                let alloc = &mut *(ptr as *mut A);
-                Allocator::clear(alloc)
-            });
+            *self.allocator_ptr.get() = Some(allocator);
         }
-    }
-
-    #[inline]
-    fn storage_ptr(&self) -> *mut u8 {
-        unsafe { (*self.storage.get()).as_mut_ptr() as *mut u8 }
-    }
-
-    #[inline]
-    fn storage_const_ptr(&self) -> *const u8 {
-        unsafe { (*self.storage.get()).as_ptr() as *const u8 }
     }
 }
 
@@ -279,157 +157,100 @@ static GLOBAL: GlobalStorage = GlobalStorage::new();
 /// use tinyalloc::global::init_global_allocator;
 /// use tinyalloc::backend::tinyslab::TinySlabAllocator;
 ///
+/// static mut MY_ALLOCATOR: TinySlabAllocator<4096, 128> = TinySlabAllocator::new();
+///
 /// fn main() {
-///     // Optional: 4KB allocator with 128 slots
-///     init_global_allocator(TinySlabAllocator::<4096, 128>::new());
+///     // User must provide a static allocator
+///     unsafe { init_global_allocator(&mut MY_ALLOCATOR); }
 /// }
 /// ```
-pub fn init_global_allocator<A: Allocator + 'static>(allocator: A) {
+pub fn init_global_allocator<A: Allocator + 'static>(allocator: &'static mut A) {
     GLOBAL.init(allocator);
 }
 
-/// Allocate a block from the global allocator
-#[inline]
-pub fn alloc(data: &[u8]) -> Option<Handle> {
-    unsafe {
-        let func = (*GLOBAL.alloc_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_ptr(), data)
-    }
-}
-
-/// Allocate an uninitialized block from the global allocator
-#[inline]
-pub fn alloc_uninit(len: usize) -> Option<(Handle, &'static mut [u8])> {
-    unsafe {
-        let func = (*GLOBAL.alloc_uninit_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_ptr(), len)
-    }
-}
-
-/// Free a block in the global allocator
-#[inline]
-pub fn free(handle: Handle) -> bool {
-    unsafe {
-        let func = (*GLOBAL.free_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_ptr(), handle)
-    }
-}
-
-/// Get immutable reference to a block
-#[inline]
-pub fn get(handle: Handle) -> Option<&'static [u8]> {
-    unsafe {
-        let func = (*GLOBAL.get_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_const_ptr(), handle)
-    }
-}
-
-/// Get mutable reference to a block
-#[inline]
-pub fn get_mut(handle: Handle) -> Option<&'static mut [u8]> {
-    unsafe {
-        let func = (*GLOBAL.get_mut_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_ptr(), handle)
-    }
-}
-
-/// Get number of allocated blocks
-#[inline]
-pub fn len() -> usize {
-    unsafe {
-        let func = (*GLOBAL.len_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_const_ptr())
-    }
-}
-
-/// Get total capacity
-#[inline]
-pub fn capacity() -> usize {
-    unsafe {
-        let func = (*GLOBAL.capacity_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_const_ptr())
-    }
-}
-
-/// Get block size
-#[inline]
-pub fn block_size() -> usize {
-    unsafe {
-        let func = (*GLOBAL.block_size_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_const_ptr())
-    }
-}
-
-/// Get bit layout
-#[inline]
-pub fn bit_layout() -> crate::BitLayout {
-    unsafe {
-        let func = (*GLOBAL.bit_layout_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_const_ptr())
-    }
-}
-
-/// Clear all allocations
-#[inline]
-pub fn clear() {
-    unsafe {
-        let func = (*GLOBAL.clear_fn.get()).unwrap_unchecked();
-        func(GLOBAL.storage_ptr())
-    }
-}
-
-/// Get statistics about the global allocator
-pub fn stats() -> AllocatorStats {
-    AllocatorStats {
-        used: len(),
-        capacity: capacity(),
-        block_size: block_size(),
-    }
-}
-
-/// Wrapper type that implements Allocator trait by forwarding to global functions
+/// Wrapper type that implements Allocator trait by forwarding to global allocator
 /// This allows ByteBuffer to work with the global allocator
 pub struct GlobalAllocatorRef;
 
 impl Allocator for GlobalAllocatorRef {
     fn alloc(&mut self, data: &[u8]) -> Option<Handle> {
-        alloc(data)
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref_mut()
+                .unwrap()
+                .alloc(data)
+        }
     }
 
     fn alloc_uninit(&mut self, len: usize) -> Option<(Handle, &mut [u8])> {
-        alloc_uninit(len)
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref_mut()
+                .unwrap()
+                .alloc_uninit(len)
+        }
     }
 
     fn free(&mut self, handle: Handle) -> bool {
-        free(handle)
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref_mut()
+                .unwrap()
+                .free(handle)
+        }
     }
 
     fn get(&self, handle: Handle) -> Option<&[u8]> {
-        get(handle)
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref()
+                .unwrap()
+                .get(handle)
+        }
     }
 
     fn get_mut(&mut self, handle: Handle) -> Option<&mut [u8]> {
-        get_mut(handle)
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref_mut()
+                .unwrap()
+                .get_mut(handle)
+        }
     }
 
     fn len(&self) -> usize {
-        len()
+        unsafe { (*GLOBAL.allocator_ptr.get()).as_deref().unwrap().len() }
     }
 
     fn capacity(&self) -> usize {
-        capacity()
+        unsafe { (*GLOBAL.allocator_ptr.get()).as_deref().unwrap().capacity() }
     }
 
     fn block_size(&self) -> usize {
-        block_size()
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref()
+                .unwrap()
+                .block_size()
+        }
     }
 
     fn bit_layout(&self) -> crate::BitLayout {
-        bit_layout()
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref()
+                .unwrap()
+                .bit_layout()
+        }
     }
 
     fn clear(&mut self) {
-        clear()
+        unsafe {
+            (*GLOBAL.allocator_ptr.get())
+                .as_deref_mut()
+                .unwrap()
+                .clear()
+        }
     }
 }
 
@@ -445,22 +266,11 @@ where
 {
     // Auto-initialize with default if not already initialized
     unsafe {
-        if (*GLOBAL.alloc_fn.get()).is_none() {
+        if (*GLOBAL.allocator_ptr.get()).is_none() {
             GlobalAllocatorConfig::Slab256b8.init();
         }
     }
     f(&mut GlobalAllocatorRef)
-}
-
-/// Statistics about the global allocator
-#[derive(Debug, Clone, Copy)]
-pub struct AllocatorStats {
-    /// Number of currently allocated slots
-    pub used: usize,
-    /// Total number of available slots
-    pub capacity: usize,
-    /// Size of each block in bytes
-    pub block_size: usize,
 }
 
 #[cfg(test)]
@@ -470,23 +280,28 @@ mod tests {
 
     #[test]
     fn test_direct_alloc() {
+        static mut ALLOC: TinySlabAllocator<2048, 64> = TinySlabAllocator::new();
         // Init
-        init_global_allocator(TinySlabAllocator::<2048, 64>::new());
+        unsafe {
+            init_global_allocator(&mut *(core::ptr::addr_of_mut!(ALLOC)));
+        }
 
-        assert_eq!(capacity(), 64);
-        assert_eq!(block_size(), 32);
-        assert_eq!(len(), 0);
+        with_global_allocator(|alloc| {
+            assert_eq!(alloc.capacity(), 64);
+            assert_eq!(alloc.block_size(), 32);
+            assert_eq!(alloc.len(), 0);
 
-        // Try to allocate directly
-        let result = alloc(b"test");
-        assert!(result.is_some(), "Allocation should succeed");
+            // Try to allocate directly
+            let result = alloc.alloc(b"test");
+            assert!(result.is_some(), "Allocation should succeed");
 
-        let handle = result.unwrap();
-        assert_eq!(get(handle), Some(&b"test"[..]));
-        assert_eq!(len(), 1);
+            let handle = result.unwrap();
+            assert_eq!(alloc.get(handle), Some(&b"test"[..]));
+            assert_eq!(alloc.len(), 1);
 
-        assert!(free(handle));
-        assert_eq!(len(), 0);
+            assert!(alloc.free(handle));
+            assert_eq!(alloc.len(), 0);
+        });
     }
 
     #[test]
@@ -494,31 +309,42 @@ mod tests {
     fn test_bytebuffer_with_global() {
         use crate::utils::bytebuffer::ByteBuffer;
 
+        static mut ALLOC: TinySlabAllocator<2048, 64> = TinySlabAllocator::new();
         // Init
-        init_global_allocator(TinySlabAllocator::<2048, 64>::new());
-        clear();
+        unsafe {
+            init_global_allocator(&mut *(core::ptr::addr_of_mut!(ALLOC)));
+        }
 
-        // Create buffer and try to append
-        let mut buf = ByteBuffer::new();
-        let result = buf.append(42);
+        with_global_allocator(|alloc| {
+            alloc.clear();
 
-        assert!(result.is_ok(), "ByteBuffer append should succeed");
-        assert_eq!(buf.len(), 1);
+            // Create buffer and try to append
+            let mut buf = ByteBuffer::new();
+            let result = buf.append(42);
+
+            assert!(result.is_ok(), "ByteBuffer append should succeed");
+            assert_eq!(buf.len(), 1);
+        });
     }
 
     #[test]
     fn test_init_custom_size() {
+        static mut ALLOC: TinySlabAllocator<4096, 128> = TinySlabAllocator::new();
         // Initialize with custom 4KB allocator
-        init_global_allocator(TinySlabAllocator::<4096, 128>::new());
+        unsafe {
+            init_global_allocator(&mut *(core::ptr::addr_of_mut!(ALLOC)));
+        }
 
-        // Verify configuration
-        assert_eq!(capacity(), 128);
-        assert_eq!(block_size(), 32);
+        with_global_allocator(|alloc| {
+            // Verify configuration
+            assert_eq!(alloc.capacity(), 128);
+            assert_eq!(alloc.block_size(), 32);
 
-        // Test allocation
-        clear();
-        let handle = alloc(b"test").unwrap();
-        assert_eq!(get(handle), Some(&b"test"[..]));
-        assert!(free(handle));
+            // Test allocation
+            alloc.clear();
+            let handle = alloc.alloc(b"test").unwrap();
+            assert_eq!(alloc.get(handle), Some(&b"test"[..]));
+            assert!(alloc.free(handle));
+        });
     }
 }

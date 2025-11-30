@@ -22,6 +22,4 @@ pub use crate::utils::bytebufferdeque::ByteBufferDeque;
 pub use crate::utils::bytebufferdeque::GlobalDeque;
 
 #[cfg(feature = "global-alloc")]
-pub use crate::global::{
-    AllocatorStats, GlobalAllocatorConfig, init_global_allocator, stats, with_global_allocator,
-};
+pub use crate::global::{GlobalAllocatorConfig, init_global_allocator, with_global_allocator};

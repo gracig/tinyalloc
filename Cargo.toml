@@ -36,3 +36,4 @@ panic = "abort"     # Smaller panic handler
 
 [profile.dev]
 opt-level = 0
+panic = "abort"     # Required for no_std examples

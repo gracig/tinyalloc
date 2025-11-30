@@ -17,13 +17,12 @@
 //! // Create a slab allocator with 1KB memory and 32 slots
 //! let mut alloc = TinySlabAllocator::<1024, 32>::new();
 //!
-//! // Create a dynamic buffer
-//! let mut buffer = ByteBuffer::new();
-//! buffer.write(&mut alloc, b"Hello, embedded world!").unwrap();
+//! // Allocate memory and use it
+//! let handle = alloc.alloc(b"Hello, embedded world!").unwrap();
 //!
 //! // Read data back
-//! let data = buffer.to_vec(&alloc);
-//! assert_eq!(&data, b"Hello, embedded world!");
+//! let data = alloc.get(handle).unwrap();
+//! assert_eq!(data, b"Hello, embedded world!");
 //! ```
 //!
 //! ## Features
@@ -52,7 +51,7 @@
 //! ```rust
 //! # use tinyalloc::prelude::*;
 //! # let mut alloc = TinySlabAllocator::<1024, 32>::new();
-//! let (handle, buf) = alloc.alloc_uninit(64).unwrap();
+//! let (handle, buf) = alloc.alloc_uninit(4).unwrap();
 //! buf.copy_from_slice(b"data");
 //!
 //! alloc.free(handle); // Increments generation
@@ -108,11 +107,10 @@
 //! ### Global Allocator Pattern
 //!
 //! ```rust,no_run
-//! use tinyalloc::global::AllocatorConfig;
 //! use tinyalloc::prelude::*;
 //!
 //! // Initialize once at startup
-//! AllocatorConfig::Slab1K32.init();
+//! GlobalAllocatorConfig::Slab1K32.init();
 //!
 //! // Use ByteBuffer anywhere
 //! let mut buf = ByteBuffer::new();
@@ -123,7 +121,6 @@
 //!
 //! ```rust,no_run
 //! use tinyalloc::prelude::*;
-//! use tinyalloc::global::AllocatorConfig;
 //!
 //! static UART_BUFFER: GlobalDeque = GlobalDeque::new();
 //!
@@ -133,7 +130,7 @@
 //! }
 //!
 //! fn main_loop() {
-//!     AllocatorConfig::Slab512b16.init();
+//!     GlobalAllocatorConfig::Slab512b16.init();
 //!     
 //!     loop {
 //!         if let Some(byte) = UART_BUFFER.pop() {
@@ -242,9 +239,9 @@ pub struct BitLayout {
 /// use tinyalloc::Handle;
 ///
 /// let handle = Handle::new(5, 2);
-/// let (slot, gen) = handle.parts();
+/// let (slot, generation) = handle.parts();
 /// assert_eq!(slot, 5);
-/// assert_eq!(gen, 2);
+/// assert_eq!(generation, 2);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Handle {

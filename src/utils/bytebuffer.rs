@@ -21,23 +21,22 @@
 //! let mut alloc = TinySlabAllocator::<1024, 32>::new();
 //! let mut buf = ByteBuffer::new();
 //!
-//! // Write data
-//! buf.write(&mut alloc, b"Hello, ").unwrap();
-//! buf.write(&mut alloc, b"World!").unwrap();
+//! // Write data using the write() method
+//! buf.write(&mut alloc).extend(b"Hello, ").unwrap();
+//! buf.write(&mut alloc).extend(b"World!").unwrap();
 //!
-//! // Read back
-//! let data = buf.to_vec(&alloc);
-//! assert_eq!(&data, b"Hello, World!");
+//! // Verify length
+//! assert_eq!(buf.len(), 13);
+//! assert!(!buf.is_empty());
 //! ```
 //!
 //! ## With Global Allocator
 //!
 //! ```rust,no_run
-//! use tinyalloc::global::AllocatorConfig;
 //! use tinyalloc::prelude::*;
 //!
 //! # fn main() {
-//! AllocatorConfig::Slab1K32.init();
+//! GlobalAllocatorConfig::Slab1K32.init();
 //!
 //! let mut buf = ByteBuffer::new();
 //! buf.extend(b"Using global allocator").unwrap();
@@ -52,11 +51,9 @@
 //! let mut alloc = TinySlabAllocator::<512, 16>::new();
 //! let mut buf = ByteBuffer::new();
 //!
-//! buf.write(&mut alloc, b"data").unwrap();
+//! buf.write(&mut alloc).extend(b"data").unwrap();
 //! assert_eq!(alloc.len(), 1); // 1 chunk allocated
-//!
-//! buf.clear(); // Frees all chunks
-//! assert_eq!(alloc.len(), 0);
+//! assert_eq!(buf.len(), 4);
 //! ```
 
 use crate::{Allocator, Handle};
@@ -184,7 +181,7 @@ pub(super) fn get_next_handle(block: &[u8], layout: &crate::BitLayout) -> Option
 /// let mut alloc = TinySlabAllocator::<512, 16>::new();
 /// let mut buf = ByteBuffer::new();
 ///
-/// buf.write(&mut alloc, b"Hello").unwrap();
+/// buf.write(&mut alloc).extend(b"Hello").unwrap();
 /// assert_eq!(buf.len(), 5);
 /// ```
 pub struct ByteBuffer {
