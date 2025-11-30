@@ -1,16 +1,38 @@
 [package]
-name = "rsalloc"
+name = "tinyalloc"
 version = "0.1.0"
 edition = "2024"
+authors = ["Your Name <your.email@example.com>"]
+license = "MIT OR Apache-2.0"
+description = "A lightweight no_std allocator for embedded systems with generation-tracked handles"
+repository = "https://github.com/yourusername/tinyalloc"
+documentation = "https://docs.rs/tinyalloc"
+readme = "README.md"
+keywords = ["allocator", "embedded", "no-std", "memory", "slab"]
+categories = ["embedded", "memory-management", "no-std"]
+rust-version = "1.85"
 
 [lib]
-name = "rsalloc"
+name = "tinyalloc"
 path = "src/allocator.rs"
 crate-type = ["rlib"]
 
 [dependencies]
 
 [features]
-default = ["tinyslab", "bytebuffer"]
+default = ["tinyslab", "bytebuffer", "global-alloc","bytebuffer-deque","global-alloc-custom"]
 tinyslab = []
 bytebuffer = []
+bytebuffer-deque = ["bytebuffer"]
+global-alloc = ["tinyslab", "bytebuffer"]
+global-alloc-custom = ["global-alloc"]
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols
+panic = "abort"     # Smaller panic handler
+
+[profile.dev]
+opt-level = 0

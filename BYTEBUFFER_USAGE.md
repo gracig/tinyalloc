@@ -17,7 +17,7 @@
 ### Creating a Buffer
 
 ```rust
-use rsalloc::utils::bytebuffer::ByteBuffer;
+use tinyalloc::utils::bytebuffer::ByteBuffer;
 
 // Create an unbounded buffer
 let mut buf = ByteBuffer::new();
@@ -29,7 +29,7 @@ let mut buf = ByteBuffer::with_max_len(100);
 ### Writing Data
 
 ```rust
-use rsalloc::utils::backend::naive::NaiveAllocator;
+use tinyalloc::utils::backend::naive::NaiveAllocator;
 
 let mut alloc = NaiveAllocator::new();
 let mut buf = ByteBuffer::new();
@@ -152,7 +152,7 @@ assert!(buf.is_empty());
 The `NaiveAllocator` provides a simple in-memory allocator for testing:
 
 ```rust
-use rsalloc::utils::backend::naive::NaiveAllocator;
+use tinyalloc::utils::backend::naive::NaiveAllocator;
 
 let mut alloc = NaiveAllocator::new();
 
@@ -177,7 +177,7 @@ alloc.free(handle);
 ## Error Handling
 
 ```rust
-use rsalloc::utils::bytebuffer::ByteBufferError;
+use tinyalloc::utils::bytebuffer::ByteBufferError;
 
 match buf.write(&mut alloc).append(b'x') {
     Ok(_) => println!("Success"),

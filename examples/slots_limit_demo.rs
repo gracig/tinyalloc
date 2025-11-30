@@ -3,8 +3,7 @@
 // This example shows that TinySlabAllocator will produce a compile error
 // if you try to use more than 255 slots.
 
-use rsalloc::Allocator;
-use rsalloc::backend::tinyslab::TinySlabAllocator;
+use tinyalloc::prelude::*;
 
 fn main() {
     // ✅ This works: 255 slots (max for u8 metadata)

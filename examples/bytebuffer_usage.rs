@@ -1,6 +1,6 @@
 //! Comprehensive ByteBuffer example demonstrating all key features
 
-use rsalloc::prelude::*;
+use tinyalloc::prelude::*;
 
 fn main() {
     println!("=== ByteBuffer Usage Examples ===\n");

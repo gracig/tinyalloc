@@ -3,7 +3,13 @@ use crate::{Allocator, Handle};
 const NONE_SLOT: u8 = u8::MAX;
 
 /// Metadata for each slot in the slab allocator
+///
+/// Stores allocation state using compact u8 fields:
+/// - generation: Incremented on free to invalidate handles
+/// - size: Actual allocated bytes (max 255)
+/// - next_free: Index of next free slot in free list
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct SlotMeta {
     generation: u8,
     size: u8,      // actual allocated size in bytes (max 255)
@@ -11,9 +17,71 @@ struct SlotMeta {
 }
 
 /// Fixed-size slab allocator with generation-tracked handles
-/// CAPACITY: total memory capacity in bytes
-/// SLOTS: number of allocation slots (max 255 for u8 metadata)
-/// Block size is CAPACITY / SLOTS
+///
+/// Provides O(1) allocation and deallocation using a free list.
+/// Memory is divided into equal-sized blocks determined by `CAPACITY / SLOTS`.
+///
+/// # Type Parameters
+///
+/// - `CAPACITY`: Total memory in bytes (e.g., 1024 for 1KB)
+/// - `SLOTS`: Number of allocation slots, **must be ≤ 255**
+///
+/// # Block Size
+///
+/// Block size = `CAPACITY / SLOTS`
+/// - Larger blocks = fewer allocations, less waste for large objects
+/// - Smaller blocks = more allocations, less waste for small objects
+///
+/// # Memory Layout
+///
+/// Each block: `[metadata: 2 bytes][data: block_size - 2 bytes]`
+/// - Metadata is bit-packed: `[generation | length | next_slot]`
+/// - Actual usable space per block = `block_size - 2`
+///
+/// # Examples
+///
+/// ```
+/// use tinyalloc::prelude::*;
+///
+/// // 1KB allocator with 32 slots
+/// // Block size = 1024 / 32 = 32 bytes (30 bytes usable per block)
+/// let mut alloc = TinySlabAllocator::<1024, 32>::new();
+///
+/// assert_eq!(alloc.capacity(), 32);
+/// assert_eq!(alloc.block_size(), 32);
+/// assert_eq!(alloc.len(), 0);
+///
+/// // Allocate some memory
+/// let (handle, buf) = alloc.alloc_uninit(16).unwrap();
+/// buf.copy_from_slice(b"Hello, World!...");
+///
+/// assert_eq!(alloc.len(), 1);
+/// assert_eq!(alloc.get(handle).unwrap().len(), 16);
+///
+/// // Free memory
+/// alloc.free(handle);
+/// assert_eq!(alloc.len(), 0);
+/// ```
+///
+/// # Compile-Time Guarantees
+///
+/// The allocator enforces `SLOTS ≤ 255` at compile time:
+///
+/// ```compile_fail
+/// use tinyalloc::prelude::*;
+/// // This will not compile:
+/// let alloc = TinySlabAllocator::<8192, 256>::new(); // SLOTS > 255
+/// ```
+///
+/// # Performance
+///
+/// | Operation | Time Complexity | Space |
+/// |-----------|-----------------|-------|
+/// | new() | O(1) | Const |
+/// | alloc() | O(1) | Free list |
+/// | free() | O(1) | Free list |
+/// | get() | O(1) | Array index |
+/// | Metadata | O(1) | 3 bytes/slot |
 pub struct TinySlabAllocator<const CAPACITY: usize, const SLOTS: usize> {
     memory: [u8; CAPACITY],
     slots: [SlotMeta; SLOTS],
@@ -30,9 +98,38 @@ impl<const CAPACITY: usize, const SLOTS: usize> TinySlabAllocator<CAPACITY, SLOT
         "SLOTS must be <= 255 to fit in u8 metadata"
     );
 
+    /// Calculate minimum bits needed to represent a value
+    const fn bits_needed(max_value: usize) -> u8 {
+        if max_value == 0 {
+            return 1;
+        }
+        let mut bits = 0;
+        let mut val = max_value;
+        while val > 0 {
+            bits += 1;
+            val >>= 1;
+        }
+        bits
+    }
+
+    /// Creates a new slab allocator with all slots initially free
+    ///
+    /// # Panics
+    ///
+    /// Panics at compile time if `SLOTS > 255`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinyalloc::prelude::*;
+    ///
+    /// let alloc = TinySlabAllocator::<512, 16>::new();
+    /// assert_eq!(alloc.len(), 0);
+    /// assert_eq!(alloc.capacity(), 16);
+    /// ```
     pub const fn new() -> Self {
-        // Force evaluation of compile-time assertion
-        let _ = Self::_ASSERT_SLOTS_FITS_U8;
+        // Force evaluation of compile-time assertion by referencing it
+        let _: () = Self::_ASSERT_SLOTS_FITS_U8;
 
         Self {
             memory: [0u8; CAPACITY],
@@ -58,19 +155,26 @@ impl<const CAPACITY: usize, const SLOTS: usize> TinySlabAllocator<CAPACITY, SLOT
         self.free_head = 0;
     }
 
-    #[inline]
+    #[inline(always)]
     fn slot_offset(&self, slot: u8) -> usize {
         slot as usize * Self::BLOCK_SIZE
     }
 
-    #[inline]
+    #[inline(always)]
     fn slot_range(&self, slot: u8, size: usize) -> (usize, usize) {
         let start = self.slot_offset(slot);
         (start, start + size)
     }
 }
 
+impl<const CAPACITY: usize, const SLOTS: usize> Default for TinySlabAllocator<CAPACITY, SLOTS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const CAPACITY: usize, const SLOTS: usize> Allocator for TinySlabAllocator<CAPACITY, SLOTS> {
+    #[inline]
     fn alloc_uninit(&mut self, len: usize) -> Option<(Handle, &mut [u8])> {
         // Check if requested size fits in a block
         if len > Self::BLOCK_SIZE {
@@ -105,6 +209,7 @@ impl<const CAPACITY: usize, const SLOTS: usize> Allocator for TinySlabAllocator<
         Some((handle, &mut self.memory[start..end]))
     }
 
+    #[inline]
     fn get(&self, handle: Handle) -> Option<&[u8]> {
         let slot_u16 = handle.slot;
 
@@ -125,6 +230,7 @@ impl<const CAPACITY: usize, const SLOTS: usize> Allocator for TinySlabAllocator<
         Some(&self.memory[start..end])
     }
 
+    #[inline]
     fn get_mut(&mut self, handle: Handle) -> Option<&mut [u8]> {
         let slot_u16 = handle.slot;
 
@@ -145,6 +251,7 @@ impl<const CAPACITY: usize, const SLOTS: usize> Allocator for TinySlabAllocator<
         Some(&mut self.memory[start..end])
     }
 
+    #[inline]
     fn free(&mut self, handle: Handle) -> bool {
         let slot_u16 = handle.slot;
 
@@ -173,16 +280,45 @@ impl<const CAPACITY: usize, const SLOTS: usize> Allocator for TinySlabAllocator<
         true
     }
 
+    #[inline(always)]
     fn len(&self) -> usize {
         self.used_count as usize
     }
 
+    #[inline(always)]
     fn capacity(&self) -> usize {
         SLOTS
     }
 
+    #[inline(always)]
     fn block_size(&self) -> usize {
         Self::BLOCK_SIZE
+    }
+
+    #[inline]
+    fn bit_layout(&self) -> crate::BitLayout {
+        // Calculate optimal bit allocation for metadata packing
+        // We need to account for a sentinel value for "none" marker
+        // So for SLOTS slots (0..SLOTS-1), we need SLOTS as the sentinel
+        let max_len = Self::BLOCK_SIZE.saturating_sub(2);
+        let max_gen = 15; // 4 bits for generation (0-15)
+
+        // Need enough bits to represent SLOTS (as sentinel), not SLOTS-1
+        let slot_bits = Self::bits_needed(SLOTS);
+        let gen_bits = Self::bits_needed(max_gen);
+        let len_bits = Self::bits_needed(max_len);
+
+        // Verify total fits in u16
+        debug_assert!(
+            slot_bits + gen_bits + len_bits <= 16,
+            "Bit layout exceeds u16 capacity"
+        );
+
+        crate::BitLayout {
+            slot_bits,
+            gen_bits,
+            len_bits,
+        }
     }
 
     fn clear(&mut self) {
@@ -366,5 +502,25 @@ mod tests {
 
         let data = alloc.get(handle).unwrap();
         assert_eq!(data, b"Hello");
+    }
+
+    #[test]
+    fn test_bit_layout() {
+        // Test TinySlabAllocator<640, 40> - 16 byte blocks
+        let alloc: TinySlabAllocator<640, 40> = TinySlabAllocator::new();
+        let layout = alloc.bit_layout();
+
+        // Verify it fits in u16
+        assert!(layout.slot_bits + layout.gen_bits + layout.len_bits <= 16);
+
+        // For 40 slots, we need 6 bits (64 max)
+        assert_eq!(layout.slot_bits, 6);
+        // For generation 0-15, we need 4 bits
+        assert_eq!(layout.gen_bits, 4);
+        // For len up to 14 (16-2), we need 4 bits
+        assert_eq!(layout.len_bits, 4);
+
+        // Total should be 14 bits, leaving 2 bits unused
+        assert_eq!(layout.slot_bits + layout.gen_bits + layout.len_bits, 14);
     }
 }

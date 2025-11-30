@@ -1,76 +1,201 @@
+//! Dynamic byte buffer backed by allocators
+//!
+//! `ByteBuffer` provides a growable buffer without heap allocation, using an allocator
+//! backend to manage memory as a linked list of chunks.
+//!
+//! # Features
+//!
+//! - **Zero-copy operations** - Direct memory access where possible
+//! - **Automatic growth** - Allocates new chunks as needed
+//! - **Chunk management** - Linked list of fixed-size blocks
+//! - **Optional limits** - Enforce maximum buffer size
+//! - **Global allocator support** - Works with static global allocators
+//!
+//! # Examples
+//!
+//! ## Basic Usage
+//!
+//! ```
+//! use tinyalloc::prelude::*;
+//!
+//! let mut alloc = TinySlabAllocator::<1024, 32>::new();
+//! let mut buf = ByteBuffer::new();
+//!
+//! // Write data
+//! buf.write(&mut alloc, b"Hello, ").unwrap();
+//! buf.write(&mut alloc, b"World!").unwrap();
+//!
+//! // Read back
+//! let data = buf.to_vec(&alloc);
+//! assert_eq!(&data, b"Hello, World!");
+//! ```
+//!
+//! ## With Global Allocator
+//!
+//! ```rust,no_run
+//! use tinyalloc::global::AllocatorConfig;
+//! use tinyalloc::prelude::*;
+//!
+//! # fn main() {
+//! AllocatorConfig::Slab1K32.init();
+//!
+//! let mut buf = ByteBuffer::new();
+//! buf.extend(b"Using global allocator").unwrap();
+//! # }
+//! ```
+//!
+//! ## Memory Management
+//!
+//! ```
+//! use tinyalloc::prelude::*;
+//!
+//! let mut alloc = TinySlabAllocator::<512, 16>::new();
+//! let mut buf = ByteBuffer::new();
+//!
+//! buf.write(&mut alloc, b"data").unwrap();
+//! assert_eq!(alloc.len(), 1); // 1 chunk allocated
+//!
+//! buf.clear(); // Frees all chunks
+//! assert_eq!(alloc.len(), 0);
+//! ```
+
 use crate::{Allocator, Handle};
 
+/// Errors that can occur during ByteBuffer operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteBufferError {
+    /// Global allocator not initialized (call init first)
     Uninitialized,
+    /// Allocator out of memory or allocation failed
     AllocationFailed,
+    /// Buffer reached maximum length limit
     Full,
 }
 
-const NONE_SLOT: u8 = u8::MAX;
 const NONE_GEN: u8 = 0;
 
 /// Block layout in arena memory (zero-copy interpretation):
-/// [0]       = len (u8) - number of data bytes used
-/// [1..n-2]  = data bytes (variable size, depends on allocator)
-/// [n-1]     = next_slot (u8) - slot index of next block
-/// [n]       = next_gen (u8) - generation of next block
+/// [0..1]    = metadata (u16) - packed: [gen_bits | len_bits | slot_bits]
+/// [2..n]    = data bytes (variable size, depends on allocator)
+///
+/// The bit layout is determined by allocator.bit_layout() and optimizes
+/// space usage based on the allocator's constraints (max slots, generations, block size)
+/// Helper functions to access block metadata using bit-packed u16
+#[inline(always)]
+pub(super) fn get_len(block: &[u8], layout: &crate::BitLayout) -> u8 {
+    let metadata = u16::from_le_bytes([block[0], block[1]]);
+    let len_mask = (1u16 << layout.len_bits) - 1;
+    let len = (metadata >> layout.slot_bits) & len_mask;
+    len as u8
+}
 
-/// Helper functions to access block metadata without Node struct
-#[inline]
-fn get_len(block: &[u8]) -> u8 {
-    block[0]
+#[inline(always)]
+fn set_len(block: &mut [u8], len: u8, layout: &crate::BitLayout) {
+    let mut metadata = u16::from_le_bytes([block[0], block[1]]);
+    let len_mask = (1u16 << layout.len_bits) - 1;
+    // Clear len bits and set new value
+    metadata &= !(len_mask << layout.slot_bits);
+    metadata |= ((len as u16) & len_mask) << layout.slot_bits;
+    let bytes = metadata.to_le_bytes();
+    block[0] = bytes[0];
+    block[1] = bytes[1];
+}
+
+#[inline(always)]
+fn get_next_slot(block: &[u8], layout: &crate::BitLayout) -> u8 {
+    let metadata = u16::from_le_bytes([block[0], block[1]]);
+    let slot_mask = (1u16 << layout.slot_bits) - 1;
+    let slot = metadata & slot_mask;
+    slot as u8
+}
+
+#[inline(always)]
+fn set_next_slot(block: &mut [u8], slot: u8, layout: &crate::BitLayout) {
+    let mut metadata = u16::from_le_bytes([block[0], block[1]]);
+    let slot_mask = (1u16 << layout.slot_bits) - 1;
+    // Clear slot bits and set new value
+    metadata &= !slot_mask;
+    metadata |= (slot as u16) & slot_mask;
+    let bytes = metadata.to_le_bytes();
+    block[0] = bytes[0];
+    block[1] = bytes[1];
 }
 
 #[inline]
-fn set_len(block: &mut [u8], len: u8) {
-    block[0] = len;
+fn get_next_gen(block: &[u8], layout: &crate::BitLayout) -> u8 {
+    let metadata = u16::from_le_bytes([block[0], block[1]]);
+    let gen_shift = layout.slot_bits + layout.len_bits;
+    let gen_mask = (1u16 << layout.gen_bits) - 1;
+    let generation = (metadata >> gen_shift) & gen_mask;
+    generation as u8
 }
 
 #[inline]
-fn get_next_slot(block: &[u8]) -> u8 {
-    block[block.len() - 2]
+fn set_next_gen(block: &mut [u8], generation: u8, layout: &crate::BitLayout) {
+    let mut metadata = u16::from_le_bytes([block[0], block[1]]);
+    let gen_shift = layout.slot_bits + layout.len_bits;
+    let gen_mask = (1u16 << layout.gen_bits) - 1;
+    // Clear gen bits and set new value
+    metadata &= !(gen_mask << gen_shift);
+    metadata |= ((generation as u16) & gen_mask) << gen_shift;
+    let bytes = metadata.to_le_bytes();
+    block[0] = bytes[0];
+    block[1] = bytes[1];
 }
 
 #[inline]
-fn set_next_slot(block: &mut [u8], slot: u8) {
-    let idx = block.len() - 2;
-    block[idx] = slot;
-}
-
-#[inline]
-fn get_next_gen(block: &[u8]) -> u8 {
-    block[block.len() - 1]
-}
-
-#[inline]
-fn set_next_gen(block: &mut [u8], generation: u8) {
-    let idx = block.len() - 1;
-    block[idx] = generation;
-}
-
-#[inline]
-fn get_data(block: &[u8]) -> &[u8] {
-    let len = get_len(block) as usize;
-    &block[1..1 + len]
+fn get_data<'a>(block: &'a [u8], layout: &crate::BitLayout) -> &'a [u8] {
+    let len = get_len(block, layout) as usize;
+    &block[2..2 + len]
 }
 
 #[inline]
 fn get_data_mut(block: &mut [u8]) -> &mut [u8] {
-    let len = block.len();
-    &mut block[1..len - 2]
+    &mut block[2..]
 }
 
 #[inline]
 fn data_capacity(block: &[u8]) -> usize {
-    block.len().saturating_sub(3)
+    block.len().saturating_sub(2)
 }
 
+#[inline(always)]
+pub(super) fn get_next_handle(block: &[u8], layout: &crate::BitLayout) -> Option<Handle> {
+    let slot = get_next_slot(block, layout);
+    let generation = get_next_gen(block, layout);
+    let max_slot = ((1u16 << layout.slot_bits) - 1) as u8;
+    if slot == max_slot {
+        None
+    } else {
+        Some(Handle::new(slot as u16, generation))
+    }
+}
+
+/// A dynamic byte buffer backed by allocator chunks
+///
+/// Stores data as a linked list of fixed-size blocks allocated from an `Allocator`.
+/// Automatically grows by allocating new chunks as needed.
+///
+/// # Examples
+///
+/// ```
+/// use tinyalloc::prelude::*;
+///
+/// let mut alloc = TinySlabAllocator::<512, 16>::new();
+/// let mut buf = ByteBuffer::new();
+///
+/// buf.write(&mut alloc, b"Hello").unwrap();
+/// assert_eq!(buf.len(), 5);
+/// ```
 pub struct ByteBuffer {
-    head: Option<Handle>,
-    tail: Option<Handle>,
-    len: u16,
-    max_len: Option<u16>,
+    /// Head of the chunk linked list
+    pub(super) head: Option<Handle>,
+    /// Tail of the chunk linked list
+    pub(super) tail: Option<Handle>,
+    /// Total number of bytes stored
+    pub(super) len: u16,
+    /// Optional maximum length limit
+    pub(super) max_len: Option<u16>,
 }
 
 impl Default for ByteBuffer {
@@ -80,6 +205,16 @@ impl Default for ByteBuffer {
 }
 
 impl ByteBuffer {
+    /// Creates a new empty ByteBuffer
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinyalloc::prelude::*;
+    /// let buf = ByteBuffer::new();
+    /// assert_eq!(buf.len(), 0);
+    /// ```
+    #[inline(always)]
     pub const fn new() -> Self {
         Self {
             head: None,
@@ -89,6 +224,16 @@ impl ByteBuffer {
         }
     }
 
+    /// Creates a new ByteBuffer with a maximum length limit
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tinyalloc::prelude::*;
+    /// let buf = ByteBuffer::with_max_len(100);
+    /// assert_eq!(buf.max_len(), Some(100));
+    /// ```
+    #[inline(always)]
     pub const fn with_max_len(max: u16) -> Self {
         Self {
             head: None,
@@ -98,15 +243,25 @@ impl ByteBuffer {
         }
     }
 
+    /// Sets the maximum length limit
+    ///
+    /// Pass `None` to remove the limit.
+    #[inline(always)]
     pub fn set_max_len(&mut self, v: Option<u16>) {
         self.max_len = v;
     }
+    /// Returns the current maximum length limit
+    #[inline(always)]
     pub fn max_len(&self) -> Option<u16> {
         self.max_len
     }
+    /// Returns the number of bytes in the buffer
+    #[inline(always)]
     pub fn len(&self) -> u16 {
         self.len
     }
+    /// Returns true if the buffer is empty
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -168,41 +323,113 @@ impl ByteBuffer {
         arena: &mut A,
         block_size: usize,
     ) -> Result<Handle, ByteBufferError> {
-        if block_size < 3 {
+        if block_size < 2 {
             return Err(ByteBufferError::AllocationFailed);
         }
 
+        let layout = arena.bit_layout();
         let (h, buf) = arena
             .alloc_uninit(block_size)
             .ok_or(ByteBufferError::AllocationFailed)?;
 
-        set_len(buf, 0);
-        set_next_slot(buf, NONE_SLOT);
-        set_next_gen(buf, NONE_GEN);
+        let none_slot = ((1u16 << layout.slot_bits) - 1) as u8;
+        set_len(buf, 0, &layout);
+        set_next_slot(buf, none_slot, &layout);
+        set_next_gen(buf, NONE_GEN, &layout);
         // Data area is already uninitialized, no need to zero it
 
         Ok(h)
     }
+}
 
-    fn get_next_handle(block: &[u8]) -> Option<Handle> {
-        let slot = get_next_slot(block);
-        if slot == NONE_SLOT {
-            None
-        } else {
-            Some(Handle::new(slot as u16, get_next_gen(block)))
+// ============================================================================
+// Global Allocator API (enabled with feature = "global-alloc")
+// ============================================================================
+
+#[cfg(feature = "global-alloc")]
+impl ByteBuffer {
+    /// Append a single byte using the global allocator
+    pub fn append(&mut self, byte: u8) -> Result<(), ByteBufferError> {
+        crate::global::with_global_allocator(|alloc| self.write(alloc).append(byte))
+    }
+
+    /// Extend with multiple bytes using the global allocator
+    pub fn extend(&mut self, data: &[u8]) -> Result<(), ByteBufferError> {
+        crate::global::with_global_allocator(|alloc| self.write(alloc).extend(data))
+    }
+
+    /// Clear all data using the global allocator
+    pub fn clear(&mut self) {
+        crate::global::with_global_allocator(|alloc| self.write(alloc).clear())
+    }
+
+    /// Iterate over bytes using the global allocator
+    pub fn bytes(&self) -> ByteBufferGlobalIter<'_> {
+        ByteBufferGlobalIter {
+            buf: self,
+            index: 0,
         }
     }
+
+    /// Copy from another buffer using global allocator
+    pub fn copy_from_global(
+        &mut self,
+        src: &Self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), ByteBufferError> {
+        crate::global::with_global_allocator(|alloc| self.copy_from(alloc, src, range))
+    }
 }
+
+/// Iterator over bytes in a ByteBuffer using the global allocator
+#[cfg(feature = "global-alloc")]
+pub struct ByteBufferGlobalIter<'a> {
+    buf: &'a ByteBuffer,
+    index: usize,
+}
+
+#[cfg(feature = "global-alloc")]
+impl<'a> Iterator for ByteBufferGlobalIter<'a> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.buf.len as usize {
+            return None;
+        }
+
+        let byte = crate::global::with_global_allocator(|alloc| {
+            self.buf.read(alloc).bytes().nth(self.index)
+        });
+
+        self.index += 1;
+        byte
+    }
+}
+
+// ============================================================================
+
+/// Read-only view of a ByteBuffer with an allocator
+///
+/// Provides methods to read data without modifying the buffer.
 pub struct ByteBufferRead<'a, A: Allocator> {
+    /// Reference to the allocator
     pub(crate) arena: &'a A,
+    /// Reference to the buffer
     pub(crate) buf: &'a ByteBuffer,
 }
 
 impl<'a, A: Allocator> ByteBufferRead<'a, A> {
+    /// Returns the number of bytes in the buffer
     pub fn len(&self) -> u16 {
         self.buf.len
     }
 
+    /// Returns true if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.buf.len == 0
+    }
+
+    /// Returns an iterator over the chunks in the buffer
     pub fn chunks(&self) -> ByteChunkIter<'a, A> {
         ByteChunkIter {
             arena: self.arena,
@@ -211,13 +438,20 @@ impl<'a, A: Allocator> ByteBufferRead<'a, A> {
         }
     }
 
+    /// Returns an iterator over individual bytes in the buffer
     pub fn bytes(&self) -> impl Iterator<Item = u8> + 'a {
         self.chunks().flat_map(|c| c.iter().copied())
     }
 }
+/// Iterator over chunks in a ByteBuffer
+///
+/// Each item is a slice representing one allocated chunk.
 pub struct ByteChunkIter<'a, A: Allocator> {
+    /// Reference to the allocator
     pub arena: &'a A,
+    /// Handle to the next chunk
     pub next_handle: Option<Handle>,
+    /// Phantom data for lifetime
     pub _marker: core::marker::PhantomData<A>,
 }
 
@@ -227,24 +461,35 @@ impl<'a, A: Allocator> Iterator for ByteChunkIter<'a, A> {
     fn next(&mut self) -> Option<Self::Item> {
         let h = self.next_handle?;
         let block = self.arena.get(h)?;
-        let data = get_data(block);
-        self.next_handle = ByteBuffer::get_next_handle(block);
+        let layout = self.arena.bit_layout();
+        let data = get_data(block, &layout);
+        self.next_handle = get_next_handle(block, &layout);
         Some(data)
     }
 }
 
+/// Mutable view of a ByteBuffer with an allocator
+///
+/// Provides methods to modify the buffer contents.
 pub struct ByteBufferWrite<'a, A: Allocator> {
+    /// Mutable reference to the allocator
     pub(crate) arena: &'a mut A,
+    /// Mutable reference to the buffer
     pub(crate) buf: &'a mut ByteBuffer,
 }
 
 impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
+    /// Clears the buffer, freeing all allocated chunks
     pub fn clear(&mut self) {
+        let layout = self.arena.bit_layout();
         let mut cursor = self.buf.head;
         while let Some(h) = cursor {
             cursor = {
-                let block = self.arena.get(h).unwrap();
-                ByteBuffer::get_next_handle(block)
+                if let Some(block) = self.arena.get(h) {
+                    get_next_handle(block, &layout)
+                } else {
+                    None
+                }
             };
             let _ = self.arena.free(h);
         }
@@ -253,12 +498,20 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
         self.buf.len = 0;
     }
 
+    /// Appends a single byte to the buffer
+    ///
+    /// # Errors
+    ///
+    /// Returns `ByteBufferError::Full` if maximum length is reached.
+    /// Returns `ByteBufferError::AllocationFailed` if allocator is out of memory.
     pub fn append(&mut self, b: u8) -> Result<(), ByteBufferError> {
-        if let Some(max) = self.buf.max_len {
-            if self.buf.len >= max {
-                return Err(ByteBufferError::Full);
-            }
+        if let Some(max) = self.buf.max_len
+            && self.buf.len >= max
+        {
+            return Err(ByteBufferError::Full);
         }
+
+        let layout = self.arena.bit_layout();
 
         if self.buf.tail.is_none() {
             // Request allocator's block size
@@ -276,7 +529,7 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
                 .arena
                 .get_mut(tail)
                 .ok_or(ByteBufferError::Uninitialized)?;
-            let len = get_len(block) as usize;
+            let len = get_len(block, &layout) as usize;
             let capacity = data_capacity(block);
             len >= capacity
         };
@@ -286,28 +539,43 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
             let new = self.buf.alloc_node(self.arena, block_size)?;
 
             // Now update the old tail to point to new node
-            let block = self.arena.get_mut(tail).unwrap();
-            set_next_slot(block, new.slot as u8);
-            set_next_gen(block, new.generation);
+            let block = self
+                .arena
+                .get_mut(tail)
+                .ok_or(ByteBufferError::Uninitialized)?;
+            set_next_slot(block, new.slot as u8, &layout);
+            set_next_gen(block, new.generation, &layout);
 
             self.buf.tail = Some(new);
 
-            let block = self.arena.get_mut(new).unwrap();
+            let block = self
+                .arena
+                .get_mut(new)
+                .ok_or(ByteBufferError::Uninitialized)?;
             let data = get_data_mut(block);
             data[0] = b;
-            set_len(block, 1);
+            set_len(block, 1, &layout);
         } else {
-            let block = self.arena.get_mut(tail).unwrap();
-            let len = get_len(block) as usize;
+            let block = self
+                .arena
+                .get_mut(tail)
+                .ok_or(ByteBufferError::Uninitialized)?;
+            let len = get_len(block, &layout) as usize;
             let data = get_data_mut(block);
             data[len] = b;
-            set_len(block, (len + 1) as u8);
+            set_len(block, (len + 1) as u8, &layout);
         }
 
         self.buf.len += 1;
         Ok(())
     }
 
+    /// Appends a slice of bytes to the buffer
+    ///
+    /// # Errors
+    ///
+    /// Returns `ByteBufferError::Full` if maximum length would be exceeded.
+    /// Returns `ByteBufferError::AllocationFailed` if allocator is out of memory.
     pub fn extend(&mut self, s: &[u8]) -> Result<(), ByteBufferError> {
         for &b in s {
             self.append(b)?;
@@ -317,33 +585,17 @@ impl<'a, A: Allocator> ByteBufferWrite<'a, A> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "tinyslab")]
 mod tests {
     use super::*;
-    use crate::backend::naive::NaiveAllocator;
+    use crate::backend::tinyslab::TinySlabAllocator;
 
-    #[test]
-    fn test_block_layout() {
-        // Verify block layout with actual allocator
-        let mut alloc = NaiveAllocator::new();
-        let (h, block) = alloc.alloc_uninit(11).unwrap();
-
-        set_len(block, 5);
-        set_next_slot(block, 42);
-        set_next_gen(block, 3);
-
-        let block = alloc.get(h).unwrap();
-        assert_eq!(get_len(block), 5);
-        assert_eq!(get_next_slot(block), 42);
-        assert_eq!(get_next_gen(block), 3);
-        assert_eq!(data_capacity(block), 8); // 11 - 3 = 8 bytes for data
-    }
-
-    // Helper to collect bytes into a fixed array for testing
-    fn collect_bytes<A: Allocator>(reader: &ByteBufferRead<A>, max: usize) -> ([u8; 256], usize) {
+    // Helper to collect bytes from iterator into fixed array
+    fn collect_bytes<A: Allocator>(buf: &ByteBuffer, arena: &A) -> ([u8; 256], usize) {
         let mut result = [0u8; 256];
         let mut count = 0;
-        for (i, b) in reader.bytes().enumerate() {
-            if i >= max {
+        for (i, b) in buf.read(arena).bytes().enumerate() {
+            if i >= 256 {
                 break;
             }
             result[i] = b;
@@ -369,116 +621,90 @@ mod tests {
 
     #[test]
     fn test_bytebuffer_append_single_byte() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut buf = ByteBuffer::new();
 
-        buf.write(&mut alloc).append(42).unwrap();
+        buf.write(&mut arena).append(42).unwrap();
 
         assert_eq!(buf.len(), 1);
-        let (bytes, count) = collect_bytes(&buf.read(&alloc), 256);
+        let (bytes, count) = collect_bytes(&buf, &arena);
         assert_eq!(count, 1);
         assert_eq!(bytes[0], 42);
     }
 
     #[test]
     fn test_bytebuffer_append_multiple_bytes() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut buf = ByteBuffer::new();
 
         let data = b"Hello";
-        buf.write(&mut alloc).extend(data).unwrap();
+        buf.write(&mut arena).extend(data).unwrap();
 
         assert_eq!(buf.len(), 5);
-        let (bytes, count) = collect_bytes(&buf.read(&alloc), 256);
+        let (bytes, count) = collect_bytes(&buf, &arena);
         assert_eq!(count, 5);
         assert_eq!(&bytes[..5], data);
     }
 
     #[test]
     fn test_bytebuffer_append_exceeds_chunk() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut buf = ByteBuffer::new();
 
-        // CHUNK is 8, so this should create multiple nodes
         let data = b"Hello World!"; // 12 bytes
-        buf.write(&mut alloc).extend(data).unwrap();
+        buf.write(&mut arena).extend(data).unwrap();
 
         assert_eq!(buf.len(), 12);
-        let (bytes, count) = collect_bytes(&buf.read(&alloc), 256);
+        let (bytes, count) = collect_bytes(&buf, &arena);
         assert_eq!(count, 12);
         assert_eq!(&bytes[..12], data);
     }
 
     #[test]
     fn test_bytebuffer_max_len_enforcement() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut buf = ByteBuffer::with_max_len(5);
 
-        let result = buf.write(&mut alloc).extend(b"Hello");
+        let result = buf.write(&mut arena).extend(b"Hello");
         assert!(result.is_ok());
         assert_eq!(buf.len(), 5);
 
         // Try to append one more
-        let result = buf.write(&mut alloc).append(b'!');
+        let result = buf.write(&mut arena).append(b'!');
         assert_eq!(result, Err(ByteBufferError::Full));
         assert_eq!(buf.len(), 5);
     }
 
     #[test]
     fn test_bytebuffer_clear() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut buf = ByteBuffer::new();
 
-        buf.write(&mut alloc).extend(b"Hello World!").unwrap();
+        buf.write(&mut arena).extend(b"Hello World!").unwrap();
         assert_eq!(buf.len(), 12);
 
-        buf.write(&mut alloc).clear();
+        buf.write(&mut arena).clear();
         assert_eq!(buf.len(), 0);
         assert!(buf.is_empty());
 
-        let (_, count) = collect_bytes(&buf.read(&alloc), 256);
+        let (_, count) = collect_bytes(&buf, &arena);
         assert_eq!(count, 0);
     }
 
     #[test]
-    fn test_bytebuffer_chunks() {
-        let mut alloc = NaiveAllocator::new();
-        let mut buf = ByteBuffer::new();
-
-        // Write 20 bytes
-        let mut data = [0u8; 20];
-        for i in 0..20 {
-            data[i] = i as u8;
-        }
-        buf.write(&mut alloc).extend(&data).unwrap();
-
-        let mut chunk_count = 0;
-        for _chunk in buf.read(&alloc).chunks() {
-            chunk_count += 1;
-        }
-        // With variable block sizes, we just verify we have at least 1 chunk
-        assert!(chunk_count >= 1);
-
-        // Verify all data is readable
-        let (reconstructed, count) = collect_bytes(&buf.read(&alloc), 256);
-        assert_eq!(count, 20);
-        assert_eq!(&reconstructed[..20], &data[..]);
-    }
-
-    #[test]
     fn test_bytebuffer_move_from() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut src = ByteBuffer::new();
         let mut dst = ByteBuffer::new();
 
-        src.write(&mut alloc).extend(b"Source data").unwrap();
+        src.write(&mut arena).extend(b"Source data").unwrap();
         assert_eq!(src.len(), 11);
 
         dst.move_from(&mut src);
 
         // dst should have the data
         assert_eq!(dst.len(), 11);
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
+        let (bytes, count) = collect_bytes(&dst, &arena);
         assert_eq!(count, 11);
         assert_eq!(&bytes[..11], b"Source data");
 
@@ -489,10 +715,10 @@ mod tests {
 
     #[test]
     fn test_bytebuffer_drain() {
-        let mut alloc = NaiveAllocator::new();
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut buf = ByteBuffer::new();
 
-        buf.write(&mut alloc).extend(b"Drain this!").unwrap();
+        buf.write(&mut arena).extend(b"Drain this!").unwrap();
         assert_eq!(buf.len(), 11);
 
         // Drain to new buffer
@@ -504,222 +730,24 @@ mod tests {
 
         // Drained should have the data
         assert_eq!(drained.len(), 11);
-        let (bytes, count) = collect_bytes(&drained.read(&alloc), 256);
+        let (bytes, count) = collect_bytes(&drained, &arena);
         assert_eq!(count, 11);
         assert_eq!(&bytes[..11], b"Drain this!");
     }
 
     #[test]
-    fn test_bytebuffer_drain_and_copy_to_another() {
-        let mut alloc = NaiveAllocator::new();
+    fn test_bytebuffer_copy_from() {
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
         let mut src = ByteBuffer::new();
         let mut dst = ByteBuffer::new();
 
-        // Add data to source
-        src.write(&mut alloc).extend(b"Source").unwrap();
-        assert_eq!(src.len(), 6);
-
-        // Add prefix to destination
-        dst.write(&mut alloc).extend(b"Prefix:").unwrap();
-        assert_eq!(dst.len(), 7);
-
-        // Copy from source to destination (appends to dst)
-        dst.copy_from(&mut alloc, &src, 0..src.len() as usize)
-            .unwrap();
-
-        // Now dst has both prefix and source data
-        assert_eq!(dst.len(), 13); // 7 + 6
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(count, 13);
-        assert_eq!(&bytes[..13], b"Prefix:Source");
-
-        // Source still has its data (copy_from doesn't drain)
-        assert_eq!(src.len(), 6);
-    }
-
-    #[test]
-    fn test_bytebuffer_drain_move_and_append() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
-
-        // Add prefix to destination
-        dst.write(&mut alloc).extend(b"Start:").unwrap();
-        assert_eq!(dst.len(), 6);
-
-        // Add data to source
-        src.write(&mut alloc).extend(b"Moved").unwrap();
-        assert_eq!(src.len(), 5);
-
-        // Copy source data to dst, then drain source
-        dst.copy_from(&mut alloc, &src, 0..src.len() as usize)
-            .unwrap();
-        src.write(&mut alloc).clear(); // Drain/clear source
-
-        assert_eq!(dst.len(), 11);
-        assert!(src.is_empty());
-
-        let (bytes, _count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(&bytes[..11], b"Start:Moved");
-    }
-
-    #[test]
-    fn test_bytebuffer_multiple_copy_append() {
-        let mut alloc = NaiveAllocator::new();
-        let mut buf1 = ByteBuffer::new();
-        let mut buf2 = ByteBuffer::new();
-        let mut result = ByteBuffer::new();
-
-        // Fill buffers
-        buf1.write(&mut alloc).extend(b"AAA").unwrap();
-        buf2.write(&mut alloc).extend(b"BBB").unwrap();
-
-        // Copy both into result (entire buffers)
-        result
-            .copy_from(&mut alloc, &buf1, 0..buf1.len() as usize)
-            .unwrap();
-        result
-            .copy_from(&mut alloc, &buf2, 0..buf2.len() as usize)
-            .unwrap();
-
-        assert_eq!(result.len(), 6);
-        let (bytes, _count) = collect_bytes(&result.read(&alloc), 256);
-        assert_eq!(&bytes[..6], b"AAABBB");
-    }
-
-    #[test]
-    fn test_bytebuffer_copy_from_entire() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
-
-        src.write(&mut alloc).extend(b"Copy this!").unwrap();
-        assert_eq!(src.len(), 10);
-
-        // Copy entire buffer using range 0..src.len()
-        dst.copy_from(&mut alloc, &src, 0..src.len() as usize)
-            .unwrap();
-
-        // Both should have the data
-        assert_eq!(dst.len(), 10);
-        assert_eq!(src.len(), 10);
-
-        let (src_bytes, src_count) = collect_bytes(&src.read(&alloc), 256);
-        let (dst_bytes, dst_count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(src_count, 10);
-        assert_eq!(dst_count, 10);
-        assert_eq!(&src_bytes[..10], b"Copy this!");
-        assert_eq!(&dst_bytes[..10], b"Copy this!");
-    }
-
-    #[test]
-    fn test_bytebuffer_read_write_lifecycle() {
-        let mut alloc = NaiveAllocator::new();
-        let mut buf = ByteBuffer::new();
-
-        // Write phase
-        {
-            let mut writer = buf.write(&mut alloc);
-            writer.extend(b"Phase 1").unwrap();
-            writer.extend(b" Phase 2").unwrap();
-        }
-
-        // Read phase
-        {
-            let reader = buf.read(&alloc);
-            let (bytes, count) = collect_bytes(&reader, 256);
-            assert_eq!(count, 15);
-            assert_eq!(&bytes[..15], b"Phase 1 Phase 2");
-        }
-
-        // Write more
-        {
-            let mut writer = buf.write(&mut alloc);
-            writer.extend(b" Phase 3").unwrap();
-        }
-
-        // Read all
-        let (bytes, count) = collect_bytes(&buf.read(&alloc), 256);
-        assert_eq!(count, 23);
-        assert_eq!(&bytes[..23], b"Phase 1 Phase 2 Phase 3");
-    }
-
-    #[test]
-    fn test_bytebuffer_empty_operations() {
-        let alloc = NaiveAllocator::new();
-        let buf = ByteBuffer::new();
-
-        // Read from empty buffer
-        let (_, count) = collect_bytes(&buf.read(&alloc), 256);
-        assert_eq!(count, 0);
-
-        let mut chunk_count = 0;
-        for _ in buf.read(&alloc).chunks() {
-            chunk_count += 1;
-        }
-        assert_eq!(chunk_count, 0);
-    }
-
-    #[test]
-    fn test_bytebuffer_set_max_len() {
-        let mut alloc = NaiveAllocator::new();
-        let mut buf = ByteBuffer::new();
-
-        assert_eq!(buf.max_len(), None);
-
-        buf.set_max_len(Some(10));
-        assert_eq!(buf.max_len(), Some(10));
-
-        buf.write(&mut alloc).extend(b"12345").unwrap();
-        assert_eq!(buf.len(), 5);
-
-        // Can add 5 more to reach limit
-        buf.write(&mut alloc).extend(b"67890").unwrap();
-        assert_eq!(buf.len(), 10);
-
-        // Try to append one more - should fail
-        let result = buf.write(&mut alloc).append(b'X');
-        assert_eq!(result, Err(ByteBufferError::Full));
-        assert_eq!(buf.len(), 10);
-
-        // Remove limit
-        buf.set_max_len(None);
-        buf.write(&mut alloc).extend(b"ABCDEFGH").unwrap();
-        assert_eq!(buf.len(), 18); // 10 + 8
-    }
-
-    #[test]
-    fn test_bytebuffer_large_data() {
-        let mut alloc = NaiveAllocator::new();
-        let mut buf = ByteBuffer::new();
-
-        // Write 100 bytes
-        let mut data = [0u8; 100];
-        for i in 0..100 {
-            data[i] = (i % 256) as u8;
-        }
-        buf.write(&mut alloc).extend(&data).unwrap();
-
-        assert_eq!(buf.len(), 100);
-
-        let (bytes, count) = collect_bytes(&buf.read(&alloc), 256);
-        assert_eq!(count, 100);
-        assert_eq!(&bytes[..100], &data[..]);
-    }
-
-    #[test]
-    fn test_bytebuffer_copy_from_basic() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
-
-        src.write(&mut alloc).extend(b"0123456789").unwrap();
+        src.write(&mut arena).extend(b"0123456789").unwrap();
 
         // Copy middle range
-        dst.copy_from(&mut alloc, &src, 3..7).unwrap();
+        dst.copy_from(&mut arena, &src, 3..7).unwrap();
 
         assert_eq!(dst.len(), 4);
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
+        let (bytes, count) = collect_bytes(&dst, &arena);
         assert_eq!(count, 4);
         assert_eq!(&bytes[..4], b"3456");
 
@@ -728,106 +756,49 @@ mod tests {
     }
 
     #[test]
-    fn test_bytebuffer_copy_from_multiple_times() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
+    fn test_bytebuffer_large_data() {
+        let mut arena = TinySlabAllocator::<4096, 128>::new();
+        let mut buf = ByteBuffer::new();
 
-        src.write(&mut alloc).extend(b"ABCDEFGHIJ").unwrap();
+        // Write 100 bytes
+        let mut data = [0u8; 100];
+        for i in 0..100 {
+            data[i] = (i % 256) as u8;
+        }
+        buf.write(&mut arena).extend(&data).unwrap();
 
-        // Copy multiple ranges to build up destination
-        dst.copy_from(&mut alloc, &src, 0..3).unwrap();
-        dst.copy_from(&mut alloc, &src, 7..10).unwrap();
+        assert_eq!(buf.len(), 100);
 
-        assert_eq!(dst.len(), 6);
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(count, 6);
-        assert_eq!(&bytes[..6], b"ABCHIJ");
+        let (bytes, count) = collect_bytes(&buf, &arena);
+        assert_eq!(count, 100);
+        assert_eq!(&bytes[..100], &data[..]);
     }
 
     #[test]
-    fn test_bytebuffer_copy_from_across_chunks() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
+    fn test_bytebuffer_set_max_len() {
+        let mut arena = TinySlabAllocator::<2048, 64>::new();
+        let mut buf = ByteBuffer::new();
 
-        // Create data that spans multiple chunks (CHUNK=8)
-        let data = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36 bytes
-        src.write(&mut alloc).extend(data).unwrap();
+        assert_eq!(buf.max_len(), None);
 
-        // Copy range that spans multiple chunks
-        dst.copy_from(&mut alloc, &src, 5..25).unwrap();
+        buf.set_max_len(Some(10));
+        assert_eq!(buf.max_len(), Some(10));
 
-        assert_eq!(dst.len(), 20);
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(count, 20);
-        assert_eq!(&bytes[..20], b"56789ABCDEFGHIJKLMNO");
-    }
+        buf.write(&mut arena).extend(b"12345").unwrap();
+        assert_eq!(buf.len(), 5);
 
-    #[test]
-    fn test_bytebuffer_copy_from_empty_range() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
+        // Can add 5 more to reach limit
+        buf.write(&mut arena).extend(b"67890").unwrap();
+        assert_eq!(buf.len(), 10);
 
-        src.write(&mut alloc).extend(b"Hello").unwrap();
+        // Try to append one more - should fail
+        let result = buf.write(&mut arena).append(b'X');
+        assert_eq!(result, Err(ByteBufferError::Full));
+        assert_eq!(buf.len(), 10);
 
-        // Copy empty range (start == end)
-        dst.copy_from(&mut alloc, &src, 2..2).unwrap();
-
-        assert_eq!(dst.len(), 0);
-        assert!(dst.is_empty());
-    }
-
-    #[test]
-    fn test_bytebuffer_copy_from_to_nonempty_dst() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
-
-        src.write(&mut alloc).extend(b"ABCDEFGH").unwrap();
-        dst.write(&mut alloc).extend(b"123").unwrap();
-
-        // Copy range to existing buffer
-        dst.copy_from(&mut alloc, &src, 2..6).unwrap();
-
-        assert_eq!(dst.len(), 7); // 3 + 4
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(count, 7);
-        assert_eq!(&bytes[..7], b"123CDEF");
-    }
-
-    #[test]
-    fn test_bytebuffer_copy_from_single_byte() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
-
-        src.write(&mut alloc).extend(b"Hello").unwrap();
-
-        // Copy single byte
-        dst.copy_from(&mut alloc, &src, 1..2).unwrap();
-
-        assert_eq!(dst.len(), 1);
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(count, 1);
-        assert_eq!(&bytes[..1], b"e");
-    }
-
-    #[test]
-    fn test_bytebuffer_copy_from_full_buffer() {
-        let mut alloc = NaiveAllocator::new();
-        let mut src = ByteBuffer::new();
-        let mut dst = ByteBuffer::new();
-
-        src.write(&mut alloc).extend(b"Complete").unwrap();
-
-        // Copy entire buffer using range
-        dst.copy_from(&mut alloc, &src, 0..8).unwrap();
-
-        assert_eq!(dst.len(), 8);
-        let (bytes, count) = collect_bytes(&dst.read(&alloc), 256);
-        assert_eq!(count, 8);
-        assert_eq!(&bytes[..8], b"Complete");
+        // Remove limit
+        buf.set_max_len(None);
+        buf.write(&mut arena).extend(b"ABCDEFGH").unwrap();
+        assert_eq!(buf.len(), 18);
     }
 }
