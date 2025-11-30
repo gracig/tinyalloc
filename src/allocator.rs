@@ -111,14 +111,12 @@
 //! use tinyalloc::global::AllocatorConfig;
 //! use tinyalloc::prelude::*;
 //!
-//! fn main() {
-//!     // Initialize once at startup
-//!     AllocatorConfig::Slab1K32.init();
+//! // Initialize once at startup
+//! AllocatorConfig::Slab1K32.init();
 //!
-//!     // Use ByteBuffer anywhere
-//!     let mut buf = ByteBuffer::new();
-//!     buf.extend(b"Global allocator!").unwrap();
-//! }
+//! // Use ByteBuffer anywhere
+//! let mut buf = ByteBuffer::new();
+//! buf.extend(b"Global allocator!").unwrap();
 //! ```
 //!
 //! ### Interrupt Handler Pattern
